@@ -155,6 +155,13 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             episode_id,
         )
         self._next_request_sequence = 0
+        task = getattr(self, "_scheduler_task", None)
+        if task is not None:
+            from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
+            scheduler = SchedulerClient.from_environment()
+            if scheduler is None:
+                raise RuntimeError("scheduled Habitat session has no coordinator")
+            scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
 
     def _protocol_observation(
         self,

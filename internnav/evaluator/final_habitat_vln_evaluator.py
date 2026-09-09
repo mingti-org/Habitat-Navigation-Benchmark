@@ -468,7 +468,12 @@ class Evaluator:
             )
 
         print(f"[EvalInit] before Env(config={config_path}, split={split})", flush=True)
-        self.env = Env(config=self.config)
+        if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
+            from habitat.datasets import make_dataset
+            self._scheduled_dataset = make_dataset(self.config.habitat.dataset.type, config=self.config.habitat.dataset)
+            self.env = None  # A lease and START precede any heavy simulator allocation.
+        else:
+            self.env = Env(config=self.config)
         print("[EvalInit] after Env(config)", flush=True)
         if hasattr(self.agent, "set_env"):
             self.agent.set_env(self.env)
@@ -1168,6 +1173,9 @@ class Evaluator:
         )
     
     def run(self):
+        if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
+            from internnav.evaluator.scheduled_evaluation import run_scheduled
+            return run_scheduled(self)
         current_scene = None
         process_bar = None
 
