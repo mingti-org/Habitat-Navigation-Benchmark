@@ -6,6 +6,7 @@ chunks, and converts them to Habitat-native discrete actions. Legacy server
 """
 
 import hashlib
+import json
 import os
 from typing import Optional
 import uuid
@@ -259,6 +260,9 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        # Identify native execution semantics without changing task/split or
+        # the canonical server identity used for stable action-noise seeds.
+        obs_payload["backend"] = "habitat"
         depth = obs_payload.get("depth")
         if depth is None:
             obs_payload.pop("depth", None)
@@ -389,7 +393,18 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             or bool(result.get("stop", False))
             or result.get("oracle_goal_gps") is not None
         ):
-            actions = habitat_actions_from_response(result)
+            diagnostics = {}
+            actions = habitat_actions_from_response(result, diagnostics=diagnostics)
+            try:
+                print("HabitatActionConversion: " + json.dumps({
+                    "episode_id": obs_payload.get("episode_id"),
+                    "scene_id": obs_payload.get("scene_id"),
+                    "step_id": obs_payload.get("step_id"),
+                    **diagnostics,
+                    "actions": actions,
+                }, separators=(",", ":")), flush=True)
+            except Exception:
+                print("[HabitatClient] Unable to record action diagnostics", flush=True)
             return _action_response(result, actions, replan_rounds)
         
         # 3. 获取 delta poses 
