@@ -5,6 +5,8 @@ chunks, and converts them to Habitat-native discrete actions. Legacy server
 ``actions`` responses remain supported during the migration window.
 """
 
+from enactive.common.policy_protocol import validate_episode_end
+
 import hashlib
 import json
 import os
@@ -250,13 +252,10 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                     raise
         if response is None:
             raise RuntimeError("Habitat episode_end produced no response")
-        try:
-            result = response.json()
-        except (TypeError, ValueError):
-            result = {"status": "success"}
+        result = validate_episode_end(response.json(), payload["event_id"])
         self._active_identity = None
         self._next_request_sequence = 0
-        return result if isinstance(result, dict) else {"status": "success"}
+        return result
 
     def _prepare_observation_payload(self, obs: dict) -> dict:
         """Make Habitat observations JSON-safe before json_numpy serialization.

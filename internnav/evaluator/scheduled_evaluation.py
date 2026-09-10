@@ -40,8 +40,6 @@ def run_scheduled(evaluator):
                 return
             task = response.get("task")
             if task is None:
-                if response.get("release_environment"):
-                    close_environment()
                 time.sleep(response["wait_seconds"])
                 continue
             scheduler.start(task)
@@ -80,7 +78,7 @@ def run_scheduled(evaluator):
                 atomic_json(Path(task["result_path"]), row)
                 scheduler.complete(task, row)
             except Exception as exc:
-                scheduler.error(task, str(exc))
+                scheduler.error(task, exc)
                 raise
     finally:
         close_environment()
