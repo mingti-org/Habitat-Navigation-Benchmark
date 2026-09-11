@@ -32,6 +32,7 @@ _MAX_REPLAN_ACK_POST_ATTEMPTS = 3
 _MAX_EPISODE_END_POST_ATTEMPTS = 3
 
 _RESPONSE_METADATA_KEYS = (
+    "normalization",
     "action_transport",
     "schema_version",
     "control_mode",
@@ -130,8 +131,10 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(self, url, *, env_id: str, debug_output_path=None):
+    def __init__(self, url, *, env_id: str, debug_output_path=None, navigation_task="vln"):
         self.url = url
+        self.navigation_task = navigation_task
+        self.normalization_metadata = None
         self.timeout = float(os.getenv("HABITAT_CLIENT_TIMEOUT", "300"))
         self.debug_output_path = debug_output_path
         self._base_env_id = str(env_id).strip()
@@ -142,6 +145,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._next_request_sequence = 0
 
     def reset(self, instruction: str, **kwargs):
+        self.normalization_metadata = None
         episode_id = str(kwargs.get("episode_id") or "").strip()
         scene_id = str(kwargs.get("scene_id") or "").strip()
         if not episode_id or not scene_id:
@@ -186,6 +190,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             ).encode("utf-8")
         ).hexdigest()
         prepared = dict(observation)
+        prepared["navigation_task"] = self.navigation_task
         prepared.update(
             {
                 "assignment_id": assignment_id,
@@ -377,6 +382,11 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 result = json_numpy.loads(result)
             if not isinstance(result, dict):
                 raise ValueError(f"unexpected /act response: {type(result)!r}")
+            selection = result.get("normalization")
+            if selection is not None:
+                if self.normalization_metadata is not None and selection != self.normalization_metadata:
+                    raise RuntimeError("normalization changed within Habitat episode")
+                self.normalization_metadata = selection
             if result.get("error"):
                 raise RuntimeError(f"policy server rejected observation: {result['error']}")
             if bool(result.get("dagger_abort_episode", False)):

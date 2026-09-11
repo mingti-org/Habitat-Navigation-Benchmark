@@ -828,6 +828,9 @@ class Evaluator:
             "success": bool(success),
             "client_trajectory_xyyaw_m": client_trajectory_xyyaw_m,
         }
+        normalization = getattr(getattr(self.agent, "traj_client", None), "normalization_metadata", None)
+        if normalization is not None:
+            result["normalization"] = normalization
         try:
             with open(os.path.join(self.output_path, "result.json"), "a") as f:
                 f.write(json.dumps(result) + "\n")

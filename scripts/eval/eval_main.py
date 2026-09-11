@@ -121,6 +121,7 @@ def parse_args():
 
     ###连接server_Gr00t，后续使用只需要换成正确的url即可，见main()的 ===== 1. Trajectory Client =====
     parser.add_argument('--gr00t_host', default='127.0.0.1')
+    parser.add_argument("--navigation-task", choices=("vln", "tracking"), default="vln")
     parser.add_argument('--gr00t_port', default=9000, type=int)  
 
     return parser.parse_args()
@@ -144,6 +145,7 @@ def main():
     traj_client = Gr00tTrajectoryClient(
         url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
         env_id=f"habitat-shard-{args.shard_rank}",
+        navigation_task=args.navigation_task,
         debug_output_path=os.path.join(args.output_path, "enactive_server_snapshots"),
     )
 
