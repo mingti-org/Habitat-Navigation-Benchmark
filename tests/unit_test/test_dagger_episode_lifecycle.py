@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
+import pytest
 
 ENACTIVE_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ENACTIVE_ROOT))
@@ -180,3 +182,127 @@ def test_native_oracle_false_stop_aborts_dagger_episode() -> None:
         assert str(exc).startswith("native_oracle_false_reached:")
     else:
         raise AssertionError("far native-oracle STOP must abort the DAgger episode")
+
+
+@pytest.fixture
+def run_resources(monkeypatch):
+    monkeypatch.delenv("ENACTIVE_SCHEDULER_ADDRESS", raising=False)
+    main = SimpleNamespace(close=Mock())
+    shadow = SimpleNamespace(close=Mock())
+    progress = SimpleNamespace(close=Mock(), update=Mock())
+    monkeypatch.setattr(
+        "internnav.evaluator.final_habitat_vln_evaluator.tqdm.tqdm",
+        lambda **kwargs: progress,
+    )
+    agent = object.__new__(LLMAgent)
+    agent.set_env(main)
+    agent._replay_teacher = shadow
+    agent._dagger_oracle_follower = object()
+    evaluator = object.__new__(Evaluator)
+    evaluator.agent = agent
+    evaluator.env = main
+    evaluator.iter_episodes = Mock(
+        return_value=iter([("episode-1", "scene-1", "instruction")])
+    )
+    evaluator.run_episode = Mock()
+    evaluator._summarize_results = Mock()
+    return SimpleNamespace(
+        evaluator=evaluator, main=main, shadow=shadow, progress=progress
+    )
+
+
+def test_run_closes_main_and_shadow_after_success(run_resources):
+    resources = run_resources
+    evaluator = resources.evaluator
+
+    evaluator.run()
+
+    evaluator.run_episode.assert_called_once_with("episode-1")
+    evaluator._summarize_results.assert_called_once_with()
+    resources.progress.update.assert_called_once_with(1)
+    # Repeated agent shutdown does not close an already released shadow again.
+    evaluator.agent.close()
+    for resource in (resources.main, resources.shadow, resources.progress):
+        resource.close.assert_called_once_with()
+    assert evaluator.env is None
+    assert evaluator.agent.env is None
+    assert evaluator.agent._replay_teacher is None
+    assert evaluator.agent._dagger_oracle_follower is None
+
+
+@pytest.mark.parametrize("stage", ["iter_episodes", "run_episode", "_summarize_results"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_run_closes_main_and_shadow_on_failure(run_resources, stage, error_type):
+    resources = run_resources
+    error = error_type("run interrupted")
+    getattr(resources.evaluator, stage).side_effect = error
+
+    with pytest.raises(error_type) as caught:
+        resources.evaluator.run()
+
+    assert caught.value is error
+    for resource in (resources.main, resources.shadow):
+        resource.close.assert_called_once_with()
+    if stage == "iter_episodes":
+        resources.progress.close.assert_not_called()
+    else:
+        resources.progress.close.assert_called_once_with()
+    if stage != "_summarize_results":
+        resources.evaluator._summarize_results.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_resource", ["main", "shadow", "progress"])
+def test_run_attempts_all_cleanup_when_one_close_fails(run_resources, failed_resource):
+    resources = run_resources
+    run_error = ValueError("episode failed")
+    close_error = RuntimeError("close failed")
+    resources.evaluator.run_episode.side_effect = run_error
+    getattr(resources, failed_resource).close.side_effect = close_error
+
+    with pytest.raises(RuntimeError) as caught:
+        resources.evaluator.run()
+
+    assert caught.value is close_error
+    assert caught.value.__context__ is run_error
+    for resource in (resources.main, resources.shadow, resources.progress):
+        resource.close.assert_called_once_with()
+
+
+def test_run_closes_main_when_shadow_is_disabled(run_resources):
+    resources = run_resources
+    resources.evaluator.agent._replay_teacher = None
+
+    resources.evaluator.run()
+
+    resources.main.close.assert_called_once_with()
+    resources.shadow.close.assert_not_called()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_scheduled_run_closes_shadow_without_reclosing_main(run_resources, monkeypatch, fail):
+    resources = run_resources
+    monkeypatch.setenv("ENACTIVE_SCHEDULER_ADDRESS", "scheduler")
+
+    def scheduled(evaluator):
+        # The scheduled loop already owns scene changes and main-env cleanup.
+        evaluator.env.close()
+        evaluator.env = None
+        evaluator.agent.set_env(None)
+        if fail:
+            raise RuntimeError("scheduler failed")
+        return "scheduled-result"
+
+    monkeypatch.setattr(
+        "internnav.evaluator.scheduled_evaluation.run_scheduled", scheduled
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="scheduler failed"):
+            resources.evaluator.run()
+    else:
+        assert resources.evaluator.run() == "scheduled-result"
+
+    resources.main.close.assert_called_once_with()
+    resources.shadow.close.assert_called_once_with()
+    resources.progress.close.assert_not_called()
+    resources.evaluator.iter_episodes.assert_not_called()
+    resources.evaluator._summarize_results.assert_not_called()

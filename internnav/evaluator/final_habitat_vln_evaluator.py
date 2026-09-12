@@ -338,6 +338,9 @@ class BaseAgent(ABC):
     def on_episode_end(self, event: dict):
         pass
 
+    def close(self):
+        pass
+
 class HabitatSensorAPI:
     def __init__(self, observations, step_id):
         self.obs = observations
@@ -1176,34 +1179,45 @@ class Evaluator:
         )
     
     def run(self):
-        if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
-            from internnav.evaluator.scheduled_evaluation import run_scheduled
-            return run_scheduled(self)
-        current_scene = None
         process_bar = None
+        try:
+            if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
+                from internnav.evaluator.scheduled_evaluation import run_scheduled
+                return run_scheduled(self)
+            current_scene = None
 
-        for episode, scene_id, episode_instruction in self.iter_episodes():
-            # === new scene ===
-            if scene_id != current_scene:
+            for episode, scene_id, episode_instruction in self.iter_episodes():
+                # === new scene ===
+                if scene_id != current_scene:
+                    if process_bar is not None:
+                        process_bar.close()
+
+                    current_scene = scene_id
+                    process_bar = tqdm.tqdm(
+                        desc=f"scene {scene_id}",
+                        unit="ep",
+                    )
+
+                # === run one episode ===
+                self.run_episode(episode)
+
+                # === update bar ===
+                process_bar.update(1)
+
+            self._summarize_results()
+        finally:
+            # Attempt every close, preserving the original exception chain.
+            try:
                 if process_bar is not None:
                     process_bar.close()
-
-                current_scene = scene_id
-                process_bar = tqdm.tqdm(
-                    desc=f"scene {scene_id}",
-                    unit="ep",
-                )
-
-            # === run one episode ===
-            self.run_episode(episode)
-
-            # === update bar ===
-            process_bar.update(1)
-
-        if process_bar is not None:
-            process_bar.close()
-
-        self._summarize_results()
+            finally:
+                try:
+                    self.agent.close()
+                finally:
+                    if self.env is not None:
+                        env = self.env
+                        self.env = None
+                        env.close()
 
     def _summarize_results(self):
         result_path = os.path.join(self.output_path, "result.json")
@@ -1358,6 +1372,14 @@ class LLMAgent(BaseAgent):
 
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
+
+    def close(self):
+        teacher = self._replay_teacher
+        self._replay_teacher = None
+        self._dagger_oracle_follower = None
+        self.env = None
+        if teacher is not None:
+            teacher.close()
 
     @staticmethod
     def _agent_state_xyzw(state):

@@ -318,8 +318,9 @@ def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
 
     def fake_post(url, data, headers, timeout):
         del headers, timeout
-        posted.append((url, json_numpy.loads(data)))
-        return _Response({"status": "success"})
+        payload = json_numpy.loads(data)
+        posted.append((url, payload))
+        return _Response({"status": "success", "event_id": payload["event_id"]})
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
     client = _client(client_module)
@@ -332,9 +333,9 @@ def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
         }
     )
 
-    assert result == {"status": "success"}
     assert posted[0][0] == "http://policy/episode_end"
     payload = posted[0][1]
+    assert result == {"status": "success", "event_id": payload["event_id"]}
     assert payload["termination_kind"] == "model_stop"
     assert payload["steps"] == 9
     assert payload["success"] is True
@@ -345,20 +346,14 @@ def test_episode_end_is_explicit_and_uses_stable_terminal_event(monkeypatch):
 def test_episode_end_retries_identical_payload_after_lost_response(monkeypatch):
     client_module = _load_http_client_module(monkeypatch)
     posted = []
-    outcomes = iter(
-        [
-            client_module.requests.ConnectionError("terminal response lost"),
-            _Response({"status": "success"}),
-        ]
-    )
 
     def fake_post(url, data, headers, timeout):
         del headers, timeout
-        posted.append((url, json_numpy.loads(data)))
-        outcome = next(outcomes)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
+        payload = json_numpy.loads(data)
+        posted.append((url, payload))
+        if len(posted) == 1:
+            raise client_module.requests.ConnectionError("terminal response lost")
+        return _Response({"status": "success", "event_id": payload["event_id"]})
 
     monkeypatch.setattr(client_module.requests, "post", fake_post)
     client = _client(client_module)
