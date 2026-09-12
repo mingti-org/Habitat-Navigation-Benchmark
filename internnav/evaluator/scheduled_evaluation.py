@@ -25,17 +25,23 @@ def run_scheduled(evaluator):
     if len(episodes) != len(evaluator._scheduled_dataset.episodes):
         raise ValueError("duplicate native scene/episode identity")
     current_scene = None
+    collection = os.environ.get("ENACTIVE_DAGGER_COLLECT") == "1"
     def close_environment():
         nonlocal current_scene
         if evaluator.env is not None:
-            evaluator.env.close()
+            environment = evaluator.env
             evaluator.env = None
-            evaluator.agent.set_env(None)
-            gc.collect()
+            try:
+                evaluator.agent.set_env(None)
+            finally:
+                try:
+                    environment.close()
+                finally:
+                    gc.collect()
         current_scene = None
     try:
         while True:
-            response = scheduler.claim()
+            response = scheduler.claim(scene_path=current_scene) if collection else scheduler.claim()
             if response.get("stop"):
                 return
             task = response.get("task")
@@ -63,16 +69,24 @@ def run_scheduled(evaluator):
                     evaluator.env = habitat.Env(config=evaluator.config, dataset=dataset)
                     evaluator.agent.set_env(evaluator.env)
                     current_scene = str(episode.scene_id)
+                # Reset after construction as well: warm and fresh environments
+                # must start the episode with the same Python/NumPy RNG streams.
+                random.seed(task["seed"])
+                np.random.seed(task["seed"])
                 evaluator.env.seed(task["seed"])
                 evaluator.output_path = str(Path(task["result_path"]).parent)
                 Path(evaluator.output_path).mkdir(parents=True, exist_ok=True)
                 client = evaluator.agent.traj_client
                 client._scheduler_task = task
                 client._client_session_id = task["lease_id"]
+                if collection:
+                    client.debug_output_path = str(Path(evaluator.output_path) / "enactive_server_snapshots")
                 evaluator.run_episode(episode)
                 row = evaluator._last_result_record
                 if not isinstance(row, dict):
                     raise RuntimeError("native episode produced no result")
+                if collection:
+                    row["server_episode_end"] = client.episode_end_result
                 # Main-environment validator runs at the coordinator. Native code
                 # must not import heavyweight/3.10-only supervisor dependencies.
                 atomic_json(Path(task["result_path"]), row)

@@ -1332,6 +1332,10 @@ class LLMAgent(BaseAgent):
 
     def set_env(self, env):
         self.env = env
+        if env is None:
+            self._dagger_oracle_follower = None
+            if self._replay_teacher is not None:
+                self._replay_teacher.close()
 
     def reset(self, instruction: str, init_yaw: float = None, initial_height: float = 0.0 , **kwargs):
         if instruction is None:

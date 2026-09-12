@@ -143,9 +143,12 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._client_session_id = uuid.uuid4().hex
         self._active_identity = None
         self._next_request_sequence = 0
+        self._session_requested = False
+        self.episode_end_result = None
 
     def reset(self, instruction: str, **kwargs):
         self.normalization_metadata = None
+        self.episode_end_result = None
         episode_id = str(kwargs.get("episode_id") or "").strip()
         scene_id = str(kwargs.get("scene_id") or "").strip()
         if not episode_id or not scene_id:
@@ -161,13 +164,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             episode_id,
         )
         self._next_request_sequence = 0
-        task = getattr(self, "_scheduler_task", None)
-        if task is not None:
-            from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
-            scheduler = SchedulerClient.from_environment()
-            if scheduler is None:
-                raise RuntimeError("scheduled Habitat session has no coordinator")
-            scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
+        self._session_requested = False
 
     def _protocol_observation(
         self,
@@ -210,6 +207,10 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
     def end_episode(self, event: dict) -> dict:
         if self._active_identity is None:
             raise RuntimeError("Habitat trajectory client has no active episode")
+        if event.get("termination_kind") == "accepted_teacher_unavailable" and not self._session_requested:
+            self._active_identity = None
+            self.episode_end_result = {"status": "not_started", "no_policy_session": True}
+            return self.episode_end_result
         assignment_id, env_id, episode_id = self._active_identity
         event_digest = hashlib.sha256(
             "\0".join(self._active_identity).encode("utf-8")
@@ -260,6 +261,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         result = validate_episode_end(response.json(), payload["event_id"])
         self._active_identity = None
         self._next_request_sequence = 0
+        self.episode_end_result = result
         return result
 
     def _prepare_observation_payload(self, obs: dict) -> dict:
@@ -369,6 +371,15 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             payload = {"observation": obs_payload}
             if self.debug_output_path:
                 payload["debug_output_path"] = self.debug_output_path
+            if not self._session_requested:
+                task = getattr(self, "_scheduler_task", None)
+                if task is not None:
+                    from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
+                    scheduler = SchedulerClient.from_environment()
+                    if scheduler is None:
+                        raise RuntimeError("scheduled Habitat session has no coordinator")
+                    scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
+                self._session_requested = True
             resp = _post_act(
                 self.url,
                 payload,

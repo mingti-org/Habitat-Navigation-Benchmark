@@ -394,3 +394,53 @@ def test_dagger_abort_response_raises_only_episode_local_signal(monkeypatch):
         client.query(_observation())
 
     assert client._active_identity is not None
+
+
+def test_unavailable_teacher_before_query_has_no_policy_session(monkeypatch):
+    from unittest.mock import Mock
+
+    client_module = _load_http_client_module(monkeypatch)
+    post = Mock(side_effect=AssertionError("no policy session was opened"))
+    monkeypatch.setattr(client_module.requests, "post", post)
+    client = _client(client_module)
+    result = client.end_episode({"termination_kind": "accepted_teacher_unavailable"})
+    assert result == {"status": "not_started", "no_policy_session": True}
+    assert client.episode_end_result == result
+    assert client._active_identity is None
+    post.assert_not_called()
+    client.reset("next", episode_id="episode-2", scene_id="scene-2")
+    assert client.episode_end_result is None
+
+
+def test_scheduled_session_registers_before_first_act_and_keeps_terminal_receipt(monkeypatch):
+    from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
+
+    client_module = _load_http_client_module(monkeypatch)
+    events = []
+    scheduler = types.SimpleNamespace(session=lambda task, identity: events.append(("session", task, identity)))
+    monkeypatch.setattr(SchedulerClient, "from_environment", lambda: scheduler)
+    receipt = {"index_path": "/fixture/lease/dagger_samples/all_samples.jsonl"}
+
+    def post(url, data, **_kwargs):
+        payload = json_numpy.loads(data)
+        events.append((url, payload))
+        if url.endswith("/act"):
+            return _Response({"dagger_abort_episode": True,
+                              "dagger_failure_type": "habitat_replay_teacher_unavailable_target"})
+        return _Response({"status": "success", "event_id": payload["event_id"], "dagger_receipt": receipt})
+
+    monkeypatch.setattr(client_module.requests, "post", post)
+    client = client_module.Gr00tTrajectoryClient("http://policy/act", env_id="worker")
+    client._scheduler_task = {"lease_id": "fixture-lease"}
+    client.reset("follow", episode_id="episode-1", scene_id="scene-1")
+    assert not events
+    with pytest.raises(client_module.DaggerEpisodeAbort):
+        client.query(_observation())
+    assert [event[0] for event in events] == ["session", "http://policy/act"]
+    assert events[0][1] == client._scheduler_task
+    assert events[0][2] == {key: events[1][1]["observation"][key]
+                           for key in ("assignment_id", "env_id", "episode_id")}
+    result = client.end_episode({"termination_kind": "accepted_teacher_unavailable"})
+    assert events[-1][0] == "http://policy/episode_end"
+    assert result["dagger_receipt"] == receipt
+    assert client.episode_end_result == result

@@ -302,7 +302,28 @@ def test_scheduled_run_closes_shadow_without_reclosing_main(run_resources, monke
         assert resources.evaluator.run() == "scheduled-result"
 
     resources.main.close.assert_called_once_with()
-    resources.shadow.close.assert_called_once_with()
+    # Scene release and final shutdown both call the idempotent session close.
+    assert resources.shadow.close.call_count == 2
     resources.progress.close.assert_not_called()
     resources.evaluator.iter_episodes.assert_not_called()
     resources.evaluator._summarize_results.assert_not_called()
+
+
+def test_scene_release_closes_shadow_but_keeps_teacher_reusable(run_resources, tmp_path):
+    from enactive.dagger.replay_teacher import ReplayTeacherSession
+    from unittest.mock import Mock
+
+    agent = run_resources.evaluator.agent
+    teacher = ReplayTeacherSession(gpu_device_id=0)
+    native_shadow = Mock()
+    teacher._simulator = native_shadow
+    teacher._scene_path = tmp_path / "scene.glb"
+    agent._replay_teacher = teacher
+    agent.set_env(None)
+    native_shadow.close.assert_called_once_with()
+    assert agent._replay_teacher is teacher
+    assert teacher._simulator is None and teacher._scene_path is None
+    assert agent._dagger_oracle_follower is None
+    agent.set_env(run_resources.main)
+    agent.close()
+    native_shadow.close.assert_called_once_with()
