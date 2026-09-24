@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import random
 import time
@@ -87,6 +88,13 @@ def run_scheduled(evaluator):
                     raise RuntimeError("native episode produced no result")
                 if collection:
                     row["server_episode_end"] = client.episode_end_result
+                    if row.get("termination_kind") == "accepted_teacher_unavailable":
+                        # An unreachable target has no finite geodesic distance.
+                        # Keep the terminal reason and receipt, using JSON null
+                        # for undefined distances instead of retrying the episode.
+                        for key in ("ne", "final_distance_to_goal", "min_distance", "shortest_path_length"):
+                            if not math.isfinite(float(row[key])):
+                                row[key] = None
                 # Main-environment validator runs at the coordinator. Native code
                 # must not import heavyweight/3.10-only supervisor dependencies.
                 atomic_json(Path(task["result_path"]), row)

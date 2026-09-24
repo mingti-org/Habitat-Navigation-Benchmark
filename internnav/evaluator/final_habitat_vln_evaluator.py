@@ -659,6 +659,13 @@ class Evaluator:
         ]
 
         while not done and step < self.max_steps:
+            # Collection may resolve unreachable episodes without a policy request.
+            # Evaluation retains its original metric/coverage contract.
+            if (os.environ.get("ENACTIVE_DAGGER_COLLECT") == "1"
+                    and float(self.env.get_metrics()["distance_to_goal"]) == float("inf")):
+                abort_reason = "navmesh_unreachable"
+                print(f"[Eval] episode={episode.episode_id} accepted teacher unavailable: {abort_reason}", flush=True)
+                break
             if self.env.episode_over:
                 break
             # === 模块 3：Habitat → Observation ===
