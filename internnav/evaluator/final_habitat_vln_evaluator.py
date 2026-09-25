@@ -436,8 +436,8 @@ class Evaluator:
             front_sensor = agent_config.sim_sensors["rgb_sensor"]
             front_orientation = list(front_sensor.orientation)
             for view_name, yaw_offset in (
-                ("left", -np.pi / 2.0),
-                ("right", np.pi / 2.0),
+                ("left", np.pi / 2.0),
+                ("right", -np.pi / 2.0),
                 ("rear", np.pi),
             ):
                 sensor = copy.deepcopy(front_sensor)
