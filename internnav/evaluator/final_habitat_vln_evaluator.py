@@ -43,6 +43,13 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
 
+from enactive.eval.online.habitat_results import read_result_rows, write_habitat_summary
+from enactive.dagger.replay_teacher import (
+    REPLAY_TEACHER_LABEL_MODE,
+    ReplayTeacherSession,
+    quaternion_angle_error_deg,
+)
+
 from internnav.model.utils.vln_utils import (
     chunk_token,
     image_resize,
@@ -54,8 +61,6 @@ from internnav.model.utils.vln_utils import (
 )
 DEFAULT_IMAGE_TOKEN = "<image>"
 
-DEFAULT_CLOSED_LOOP_THRESHOLDS_M = (1.0, 3.0)
-
 
 # Habitat's base RGB sensor always reports the UUID "rgb". Distinct UUIDs are
 # required for multiple simultaneous cameras in one SensorSuite.
@@ -64,62 +69,6 @@ def _safe_float(value: Any, default: float = float("nan")) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _finite_or_none(value: Any) -> Optional[float]:
-    val = _safe_float(value)
-    return val if np.isfinite(val) else None
-
-
-def _success_weighted_path_length(success: float, shortest_path_length: float, path_length: float) -> float:
-    if success <= 0.0:
-        return 0.0
-    if shortest_path_length <= 0.0 or not np.isfinite(shortest_path_length):
-        return 0.0
-    denom = max(float(path_length), float(shortest_path_length))
-    if denom <= 0.0 or not np.isfinite(denom):
-        return 0.0
-    return float(success) * float(shortest_path_length) / denom
-
-
-def _metrics_at_threshold(rows: list[dict[str, Any]], threshold_m: float) -> dict[str, float]:
-    if not rows:
-        return {
-            "sr": 0.0,
-            "spl": 0.0,
-            "os": 0.0,
-            "ne": 0.0,
-            "count": 0,
-            "threshold_m": float(threshold_m),
-        }
-
-    sr_vals: list[float] = []
-    spl_vals: list[float] = []
-    os_vals: list[float] = []
-    ne_vals: list[float] = []
-    for row in rows:
-        final_distance = _safe_float(row.get("ne"), float("inf"))
-        min_distance = _safe_float(row.get("min_distance"), final_distance)
-        path_length = _safe_float(row.get("path_length"), float("nan"))
-        shortest_path_length = _safe_float(row.get("shortest_path_length"), float("nan"))
-        stopped = bool(row.get("stopped", float(row.get("success", 0.0)) > 0.0))
-        success = float(stopped and final_distance <= threshold_m)
-        oracle_success = float(min_distance <= threshold_m)
-        spl = _success_weighted_path_length(success, shortest_path_length, path_length)
-
-        sr_vals.append(success)
-        spl_vals.append(spl)
-        os_vals.append(oracle_success)
-        ne_vals.append(final_distance)
-
-    return {
-        "sr": float(sum(sr_vals) / len(sr_vals)),
-        "spl": float(sum(spl_vals) / len(spl_vals)),
-        "os": float(sum(os_vals) / len(os_vals)),
-        "ne": float(sum(ne_vals) / len(ne_vals)),
-        "count": len(rows),
-        "threshold_m": float(threshold_m),
-    }
 
 
 def build_traj_request(obs, instruction: str, rel_height: float):
@@ -651,6 +600,7 @@ class Evaluator:
         observations = self.env.reset()
         print(f"[EvalInitEpisode] after reset episode={getattr(episode, 'episode_id', '')}", flush=True)
         observations = self._repair_observation_render(observations, "reset")
+        shortest_path_length = float(self.env.get_metrics()["distance_to_goal"])
 
         # === 初始高度（给 agent 用）===
         initial_height = self.env.sim.get_agent_state().position[1]
@@ -670,36 +620,11 @@ class Evaluator:
         self.initial_height = initial_height
         self._prev_video_map_coord = None
 
-        return observations, initial_height
-
-    @staticmethod
-    def _episode_shortest_path_length(episode) -> Optional[float]:
-        candidates = []
-        info = getattr(episode, "info", None)
-        if isinstance(info, dict):
-            candidates.extend(
-                [
-                    info.get("geodesic_distance"),
-                    info.get("shortest_path_length"),
-                    info.get("shortest_path_distance"),
-                ]
-            )
-        candidates.extend(
-            [
-                getattr(episode, "geodesic_distance", None),
-                getattr(episode, "shortest_path_length", None),
-                getattr(episode, "shortest_path_distance", None),
-            ]
-        )
-        for candidate in candidates:
-            value = _finite_or_none(candidate)
-            if value is not None and value >= 0.0:
-                return value
-        return None
+        return observations, initial_height, shortest_path_length
 
     def run_episode(self, episode):
         # ===== Episode init =====
-        observations, initial_height = self._init_episode(episode)
+        observations, initial_height, shortest_path_length = self._init_episode(episode)
         episode_instruction = self._episode_instruction_text(episode)
         self.agent.reset(
             episode_instruction,
@@ -821,9 +746,16 @@ class Evaluator:
         # ===== episode end =====
         metrics = self.env.get_metrics()
         
-        # ===== evaluator-level metric =====
+        # ===== evaluator-level metric（和之前完全一致）=====
+        success = metrics["success"]
+        spl = metrics["spl"]
         ne = metrics["distance_to_goal"]
+        # print("self.config.habitat.task",self.config.habitat.task)
+        # oracle_success：自己算（等价于你之前的）
         ndtw_score = metrics.get("ndtw", 0.0)
+        oracle_success = float(
+            min_distance < self.config.habitat.task.measurements.success.success_distance
+        )
         stopped = bool(last_action_value == Action.STOP.value)
         termination_kind = (
             "model_stop"
@@ -834,14 +766,6 @@ class Evaluator:
         )
         if not np.isfinite(min_distance):
             min_distance = ne
-        shortest_path_length = self._episode_shortest_path_length(episode)
-        if shortest_path_length is None:
-            shortest_path_length = float("nan")
-        success_distance = float(self.config.habitat.task.measurements.success.success_distance)
-        success = float(stopped and ne <= success_distance)
-        oracle_success = float(min_distance <= success_distance)
-        spl = _success_weighted_path_length(success, shortest_path_length, path_length)
-
         self.sucs.append(success)
         self.spls.append(spl)
         self.oss.append(oracle_success)
@@ -858,7 +782,7 @@ class Evaluator:
             "final_distance_to_goal": ne,
             "min_distance": float(min_distance),
             "ndtw": ndtw_score,
-            "success_distance": success_distance,
+            "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
             "path_length": float(path_length),
             "shortest_path_length": float(shortest_path_length),
             "stopped": bool(stopped),
@@ -1077,11 +1001,11 @@ class Evaluator:
         return (hdiff > 50.0 and vdiff > 50.0 and std > 55.0) or purple_like or almost_black
 
     def _repair_observation_render(self, observations, context):
-        """Habitat reset/step can occasionally return an uninitialized RGB buffer.
+        """Repair an invalid Habitat RGB buffer without moving the agent.
 
-        The bad frame is a stable high-frequency snow pattern. A direct sensor
-        re-render fixes it without changing the agent pose, so patch the RGB
-        and depth entries before the observation reaches the model.
+        A direct sensor re-render at the current pose can replace an invalid RGB
+        entry before the observation reaches the model. Depth validity is not a
+        render-repair condition because the canonical policy can run without it.
         """
         if not isinstance(observations, dict) or "rgb" not in observations:
             return observations
@@ -1106,46 +1030,45 @@ class Evaluator:
             try:
                 fresh = self._fresh_sensor_observations(attempt)
             except Exception as exc:
-                print(f"[Eval] RGB repair failed at {context}: {exc}")
+                print(
+                    f"[Eval] Render repair attempt {attempt}/{max_attempts} failed "
+                    f"at {context}: {exc}"
+                )
+                if attempt < max_attempts:
+                    continue
                 if fail_on_corrupt:
-                    raise RuntimeError(f"RGB repair failed at {context}: {exc}") from exc
+                    raise RuntimeError(f"Render repair failed at {context}: {exc}") from exc
                 return observations
 
             fresh_rgb = fresh.get("rgb") if isinstance(fresh, dict) else None
-            if fresh_rgb is None:
-                if fail_on_corrupt:
-                    raise RuntimeError(f"RGB repair at {context} returned no rgb on attempt {attempt}")
-                return observations
-
-            fresh_is_corrupt = Evaluator._is_corrupt_rgb(fresh_rgb)
-            if not fresh_is_corrupt:
+            if fresh_rgb is not None and not Evaluator._is_corrupt_rgb(fresh_rgb):
                 repaired = dict(observations)
-                repaired["rgb"] = np.ascontiguousarray(fresh_rgb[..., :3] if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4 else fresh_rgb)
-                if isinstance(fresh, dict) and "depth" in fresh:
-                    repaired["depth"] = fresh["depth"]
+                repaired["rgb"] = np.ascontiguousarray(
+                    fresh_rgb[..., :3]
+                    if fresh_rgb.ndim == 3 and fresh_rgb.shape[-1] == 4
+                    else fresh_rgb
+                )
                 after = Evaluator._rgb_noise_stats(repaired["rgb"])
-                if force_rerender:
-                    print(
-                        f"[Eval] Forced RGB rerender at {context} on attempt {attempt}: "
-                        f"{before} -> {after}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[Eval] Repaired corrupt RGB at {context} on rerender {attempt}: "
-                        f"{before} -> {after}",
-                        flush=True,
+                label = "Forced RGB rerender" if force_rerender else "Repaired corrupt RGB"
+                print(
+                    f"[Eval] {label} at {context} on attempt {attempt}: "
+                    f"{before} -> {after}",
+                    flush=True,
                 )
                 return repaired
             print(
-                f"[Eval] RGB repair attempt {attempt}/{max_attempts} still corrupt at {context}: "
-                f"{Evaluator._rgb_noise_stats(fresh_rgb)}",
+                f"[Eval] RGB repair attempt {attempt}/{max_attempts} still corrupt "
+                f"at {context}: {Evaluator._rgb_noise_stats(fresh_rgb)}",
                 flush=True,
             )
 
-        print(f"[Eval] WARNING: RGB still looks corrupt after rerender at {context}: {before}")
+        print(
+            f"[Eval] WARNING: RGB still looks corrupt after rerender at {context}: {before}"
+        )
         if fail_on_corrupt:
-            raise RuntimeError(f"RGB still corrupt after {max_attempts} rerenders at {context}: {before}")
+            raise RuntimeError(
+                f"RGB still corrupt after {max_attempts} rerenders at {context}: {before}"
+            )
         return observations
 
     def _fresh_sensor_observations(self, attempt: int = 1):
@@ -1165,7 +1088,8 @@ class Evaluator:
             )
             if fresh is not None:
                 return fresh
-        return self.env.sim.get_sensor_observations()
+        raw_observations = self.env.sim.get_sensor_observations()
+        return self.env.sim.sensor_suite.get_observations(raw_observations)
 
     def _build_observation(self, observations, step_id, agent_height=None, metrics=None):
         if agent_height is None:
@@ -1256,48 +1180,15 @@ class Evaluator:
 
     def _summarize_results(self):
         result_path = os.path.join(self.output_path, "result.json")
-        rows = []
-        if os.path.exists(result_path):
-            with open(result_path, encoding="utf-8") as f:
-                rows = [json.loads(line) for line in f if line.strip()]
-
-        def _mean(key: str) -> float:
-            return float(sum(_safe_float(row.get(key), 0.0) for row in rows) / len(rows)) if rows else 0.0
-
         native_threshold = float(self.config.habitat.task.measurements.success.success_distance)
-        threshold_metrics = {
-            f"{threshold:g}m": _metrics_at_threshold(rows, threshold)
-            for threshold in DEFAULT_CLOSED_LOOP_THRESHOLDS_M
-        }
-        summary = {
-            "sucs_all": _mean("success"),
-            "spls_all": _mean("spl"),
-            "oss_all": _mean("os"),
-            "nes_all": _mean("ne"),
-            "length": len(rows),
-            "success_distance": native_threshold,
-            "metrics_by_threshold": threshold_metrics,
-        }
-        metrics_summary = {
-            "native_success_distance_m": native_threshold,
-            "thresholds_m": list(DEFAULT_CLOSED_LOOP_THRESHOLDS_M),
-            "metrics_by_threshold": threshold_metrics,
-            "legacy": {
-                "sucs_all": summary["sucs_all"],
-                "spls_all": summary["spls_all"],
-                "oss_all": summary["oss_all"],
-                "nes_all": summary["nes_all"],
-                "length": summary["length"],
-                "success_distance": native_threshold,
-            },
-        }
-
+        rows = read_result_rows([result_path])
+        write_habitat_summary(
+            rows,
+            self.output_path,
+            native_success_distance_m=native_threshold,
+        )
         print("===== EVAL SUMMARY =====")
-        print(summary)
-        with open(os.path.join(self.output_path, "summary.json"), "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
-        with open(os.path.join(self.output_path, "metrics_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(metrics_summary, f, indent=2)
+        print({"length": len(rows), "success_distance": native_threshold})
 
 class LLMAgent(BaseAgent):
     def __init__(
@@ -1373,6 +1264,29 @@ class LLMAgent(BaseAgent):
         }
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
+        self._replay_teacher_mode = os.getenv(
+            "HABITAT_DAGGER_TEACHER_MODE", ""
+        ).strip().lower()
+        if self._replay_teacher_mode not in {"", REPLAY_TEACHER_LABEL_MODE}:
+            raise ValueError(
+                "HABITAT_DAGGER_TEACHER_MODE must be empty or "
+                f"{REPLAY_TEACHER_LABEL_MODE!r}"
+            )
+        self._replay_teacher = (
+            ReplayTeacherSession(
+                gpu_device_id=int(getattr(args, "sim_gpu", 0)),
+                target_path_length_m=float(
+                    os.getenv("ENACTIVE_DAGGER_TARGET_PATH_LENGTH_M", "1.5")
+                ),
+                waypoint_radius_m=float(
+                    os.getenv("HABITAT_DAGGER_TEACHER_WAYPOINT_RADIUS_M", "0.5")
+                ),
+                max_steps=int(os.getenv("HABITAT_DAGGER_TEACHER_MAX_STEPS", "128")),
+            )
+            if self._replay_teacher_mode == REPLAY_TEACHER_LABEL_MODE
+            else None
+        )
+        self._replay_teacher_progress_index = 0
 
     def set_env(self, env):
         self.env = env
@@ -1406,6 +1320,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_follower = None
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
+        self._replay_teacher_progress_index = 0
 
         self.last_pixel_goal = None
 
@@ -1415,8 +1330,67 @@ class LLMAgent(BaseAgent):
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
 
+    @staticmethod
+    def _agent_state_xyzw(state):
+        from habitat_sim.utils.common import quat_to_coeffs
+
+        return (
+            np.asarray(state.position, dtype=np.float32).reshape(3),
+            np.asarray(quat_to_coeffs(state.rotation), dtype=np.float32).reshape(4),
+        )
+
+    def _build_replay_teacher_payload(self):
+        if self._replay_teacher is None:
+            return None
+        if self.env is None:
+            raise RuntimeError("shadow replay teacher requires the active Habitat environment")
+        episode = getattr(self.env, "current_episode", None)
+        if episode is None:
+            raise RuntimeError("shadow replay teacher requires the active Habitat episode")
+
+        reference = np.asarray(getattr(episode, "reference_path", None), dtype=np.float32)
+        goals = list(getattr(episode, "goals", []) or [])
+        goal = goals[0] if goals else None
+        goal_position = (
+            goal.get("position") if isinstance(goal, dict)
+            else getattr(goal, "position", None)
+        )
+        if goal_position is None:
+            raise RuntimeError("shadow replay teacher requires an official episode goal")
+        scene_path = getattr(self.env.sim, "_current_scene", None)
+        if not scene_path or not os.path.isfile(str(scene_path)):
+            raise RuntimeError(
+                f"shadow replay teacher cannot resolve the active scene: {scene_path!r}"
+            )
+
+        before_state = self.env.sim.get_agent_state()
+        before_position, before_rotation = self._agent_state_xyzw(before_state)
+        payload = self._replay_teacher.rollout(
+            scene_path=scene_path,
+            episode_start_position=getattr(episode, "start_position"),
+            episode_start_rotation_xyzw=getattr(episode, "start_rotation"),
+            reference_path_world=reference,
+            goal_world=goal_position,
+            student_position_world=before_position,
+            student_rotation_world_xyzw=before_rotation,
+            progress_index=self._replay_teacher_progress_index,
+        )
+        after_state = self.env.sim.get_agent_state()
+        after_position, after_rotation = self._agent_state_xyzw(after_state)
+        payload["main_pose_position_error_m"] = float(
+            np.linalg.norm(after_position - before_position)
+        )
+        payload["main_pose_rotation_error_deg"] = quaternion_angle_error_deg(
+            after_rotation, before_rotation
+        )
+        self._replay_teacher_progress_index = int(payload["progress_index"])
+        return payload
+
     def _query_trajectory_server(self, request: dict, **kwargs):
         request_payload = dict(request)
+        teacher_payload = self._build_replay_teacher_payload()
+        if teacher_payload is not None:
+            request_payload["dagger_teacher_rollout"] = teacher_payload
         request_payload["executed_actions"] = list(self._executed_actions_since_query)
         response = self.traj_client.query(request_payload, **kwargs)
         self._executed_actions_since_query.clear()

@@ -88,10 +88,10 @@ class VLNPEMetrics(BaseMetric):
         self.metrics['shortest_path_length'] = self.shortest_path_length
         # calculate success distance
         self.metrics['NE'] = self.ne
-        self.metrics['success'] = float(self.ne <= self.success_distance)
+        self.metrics['success'] = float(self.ne < self.success_distance)
 
         # OSR check if it has ever been successful
-        self.metrics['osr'] = float(self.shortest_path_length_calc <= self.success_distance)
+        self.metrics['osr'] = float(self.shortest_path_length_calc < self.success_distance)
 
         # calculate TL, trajectory total length
         self.metrics['TL'] = self.current_path_length

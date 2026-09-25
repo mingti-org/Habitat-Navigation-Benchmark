@@ -24,6 +24,8 @@ from internnav.evaluator.canonical_action import (
     habitat_actions_from_response,
 )
 
+json_numpy.patch()
+
 _MAX_REPLAN_ROUNDS = 4
 _MAX_REPLAN_ACK_POST_ATTEMPTS = 3
 _MAX_EPISODE_END_POST_ATTEMPTS = 3
@@ -53,6 +55,13 @@ _RESPONSE_METADATA_KEYS = (
     "dagger_final_actions_discrete",
     "dagger_correction_applied",
 )
+
+
+def _flip_lateral_axis(value):
+    converted = np.asarray(value, dtype=np.float32).copy()
+    if converted.size:
+        converted[..., 1] *= -1.0
+    return converted.tolist()
 
 
 def _replan_ack(result: dict) -> dict:
@@ -111,6 +120,10 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
     for key in _RESPONSE_METADATA_KEYS:
         if key in result:
             response[key] = result[key]
+    if response.get("oracle_goal_gps") is not None:
+        response["oracle_goal_gps"] = _flip_lateral_axis(
+            response["oracle_goal_gps"]
+        )
     return response
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
@@ -315,6 +328,47 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        depth = obs_payload.get("depth")
+        if depth is None:
+            obs_payload.pop("depth", None)
+        else:
+            try:
+                depth_array = np.asarray(depth)
+                valid_depth = (
+                    depth_array.size > 0
+                    and np.issubdtype(depth_array.dtype, np.number)
+                    and bool(np.isfinite(depth_array).all())
+                )
+            except (TypeError, ValueError):
+                valid_depth = False
+            if not valid_depth:
+                print(
+                    "[HabitatClient] WARNING: omitting invalid depth from canonical "
+                    f"request episode={obs_payload.get('episode_id', '')} "
+                    f"step={obs_payload.get('step_id', '')}",
+                    flush=True,
+                )
+                obs_payload.pop("depth", None)
+        gps = np.asarray(obs_payload["gps"], dtype=np.float32).reshape(-1)
+        yaw_rad = float(np.asarray(obs_payload["yaw"]).reshape(-1)[0])
+        camera_height = float(np.asarray(obs_payload["camera_height"]).reshape(-1)[0])
+        obs_payload["state_xyzyaw"] = [
+            float(gps[0]),
+            -float(gps[1]),
+            camera_height,
+            float(np.degrees(yaw_rad)),
+        ]
+        if obs_payload.get("reference_path_gps") is not None:
+            obs_payload["reference_path_gps"] = _flip_lateral_axis(
+                obs_payload["reference_path_gps"]
+            )
+        metrics = obs_payload.get("metrics")
+        if isinstance(metrics, dict):
+            metrics = dict(metrics)
+            for key in ("reference_path_gps", "goal_gps"):
+                if metrics.get(key) is not None:
+                    metrics[key] = _flip_lateral_axis(metrics[key])
+            obs_payload["metrics"] = metrics
         obs_payload["client_capabilities"] = {
             key: list(values) for key, values in CLIENT_CAPABILITIES.items()
         }
