@@ -430,9 +430,10 @@ class Evaluator:
             agent_config = self.config.habitat.simulator.agents.main_agent
             front_sensor = agent_config.sim_sensors["rgb_sensor"]
             front_orientation = list(front_sensor.orientation)
+            # Habitat TURN_LEFT rotates positively around the local +Y axis.
             for view_name, yaw_offset in (
-                ("left", -np.pi / 2.0),
-                ("right", np.pi / 2.0),
+                ("left", np.pi / 2.0),
+                ("right", -np.pi / 2.0),
                 ("rear", np.pi),
             ):
                 sensor = copy.deepcopy(front_sensor)

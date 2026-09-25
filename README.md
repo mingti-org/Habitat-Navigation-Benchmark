@@ -63,3 +63,34 @@ previous HTTP query. STOP remains Habitat action `0`; oracle-goal responses keep
 using the local `ShortestPathFollower`; control-only replan responses are ACKed and
 retried without executing an environment action. Protocol/observation errors abort
 the rollout instead of being interpreted as a normal STOP.
+
+
+## Physical camera directions
+
+The four current RGB views share one agent position. Habitat looks along local
+`-Z`; a native `TURN_LEFT` rotates about `+Y`. Therefore the `left` sensor uses
+`+pi/2` yaw relative to the front sensor, `right` uses `-pi/2`, and `rear` uses
+`pi`. The request keeps these physical names in `rgb_views`; it does not exchange
+left and right later in the transport.
+
+The integration regression constructs the actual `Evaluator` and Habitat `Env`,
+then compares the left/right cameras with the front camera after native
+90-degree turns, and the rear camera after a native 180-degree turn. It checks
+actual sensor rotations, rendered pixels, unchanged position,
+and the canonical request received from the real client payload builder. Both
+level cameras and the default two LOOK_DOWN actions are covered. No policy
+weights or HTTP server are needed.
+
+Run it in the normal Habitat evaluator environment with Enactive importable and
+a config pointing to real scene/dataset assets:
+
+```sh
+HABITAT_CAMERA_TEST_CONFIG=/absolute/path/to/habitat.yaml \
+HABITAT_CAMERA_TEST_GPU=0 \
+PYTHONPATH="$PWD:$PWD/depth_camera_filtering-main" \
+python -m pytest tests/integration/test_habitat_camera_directions.py -q
+```
+
+The default split is `val_unseen`; set `HABITAT_CAMERA_TEST_SPLIT` when needed.
+The configured native turn angle must divide 90 degrees. The test skips when
+`HABITAT_CAMERA_TEST_CONFIG` is absent; invalid render buffers fail the test.
