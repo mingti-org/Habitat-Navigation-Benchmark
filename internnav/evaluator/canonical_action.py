@@ -89,7 +89,7 @@ def canonical_response_to_trajectory(response: dict[str, Any]) -> np.ndarray:
         trajectory[index, 0] = previous[0] + cos_yaw * dx - sin_yaw * dy
         trajectory[index, 1] = previous[1] + sin_yaw * dx + cos_yaw * dy
         trajectory[index, 2] = previous[2] + dz
-        trajectory[index, 3] = (previous[3] + dyaw_deg + 180.0) % 360.0 - 180.0
+        trajectory[index, 3] = previous[3] + dyaw_deg
     return trajectory
 
 
@@ -122,22 +122,25 @@ def trajectory_to_discrete_actions_close_to_goal(
 
     def resample_path(path_xy, min_spacing):
         if len(path_xy) <= 2:
-            return path_xy.astype(np.float64)
+            return path_xy.astype(np.float64), np.arange(len(path_xy))
         sampled = [path_xy[0].astype(np.float64)]
+        indices = [0]
         accumulated = 0.0
         last = path_xy[0].astype(np.float64)
-        for current_value in path_xy[1:]:
+        for source_idx, current_value in enumerate(path_xy[1:], 1):
             current = current_value.astype(np.float64)
             accumulated += float(np.linalg.norm(current - last))
             if accumulated >= min_spacing:
                 sampled.append(current)
+                indices.append(source_idx)
                 accumulated = 0.0
             last = current
         if np.linalg.norm(sampled[-1] - path_xy[-1]) > 1e-6:
             sampled.append(path_xy[-1].astype(np.float64))
-        return np.asarray(sampled, dtype=np.float64)
+            indices.append(len(path_xy) - 1)
+        return np.asarray(sampled, dtype=np.float64), np.asarray(indices)
 
-    track_xy = resample_path(traj_xy, min_spacing=max(step_size * 0.8, 0.12))
+    track_xy, source_indices = resample_path(traj_xy, min_spacing=max(step_size * 0.8, 0.12))
     goal = track_xy[-1]
     total_xy_displacement = float(np.linalg.norm(track_xy[-1] - track_xy[0]))
     # Match the server's 0.25 m geometric STOP window without changing the
@@ -152,15 +155,39 @@ def trajectory_to_discrete_actions_close_to_goal(
     def normalize_angle(angle):
         return (angle + np.pi) % (2 * np.pi) - np.pi
 
+    def signed_error(bearing, curr_yaw, pose_yaw):
+        """Use a matched pose only when left/right native turn counts tie."""
+        error = normalize_angle(bearing - curr_yaw)
+        positive = (bearing - curr_yaw) % (2 * np.pi)
+        negative = (curr_yaw - bearing) % (2 * np.pi)
+
+        def turn_count(angle):
+            return int(np.ceil(max(0.0, angle - turn_angle_rad * 0.5 - 1e-12) / turn_angle_rad))
+
+        positive_count = turn_count(positive)
+        if positive_count == 0 or positive_count != turn_count(negative) or pose_yaw is None:
+            return error
+        # A later corner's heading must not dictate how to face this XY target.
+        if abs(normalize_angle(pose_yaw - bearing)) > turn_angle_rad * 0.5 + 1e-12:
+            return error
+        raw_hint = pose_yaw - curr_yaw
+        epsilon = np.deg2rad(1e-3)
+        if abs(raw_hint) > np.pi + epsilon or abs(raw_hint) < 1e-12:
+            return error
+        hint = normalize_angle(raw_hint)
+        if abs(abs(raw_hint) - np.pi) <= epsilon:
+            hint = np.copysign(np.pi, raw_hint)
+        return np.copysign(abs(error), hint)
+
     def apply_action(curr_pos, curr_yaw, action):
         if action == 1:
             next_pos = curr_pos + step_size * np.array([np.cos(curr_yaw), np.sin(curr_yaw)])
             return next_pos, curr_yaw
         if action == 2:
             sign = 1.0 if positive_yaw_action == 2 else -1.0
-            return curr_pos, normalize_angle(curr_yaw + sign * turn_angle_rad)
+            return curr_pos, curr_yaw + sign * turn_angle_rad
         sign = 1.0 if positive_yaw_action == 3 else -1.0
-        return curr_pos, normalize_angle(curr_yaw + sign * turn_angle_rad)
+        return curr_pos, curr_yaw + sign * turn_angle_rad
 
     def turn_action_for_yaw_sign(sign):
         if sign > 0:
@@ -170,7 +197,7 @@ def trajectory_to_discrete_actions_close_to_goal(
     def append_final_turns(curr_yaw, remaining_budget):
         if goal_yaw is None or remaining_budget <= 0:
             return [], curr_yaw
-        yaw_error = normalize_angle(goal_yaw - curr_yaw)
+        yaw_error = signed_error(goal_yaw, curr_yaw, goal_yaw)
         turn_count = int(round(yaw_error / turn_angle_rad))
         if turn_count == 0:
             return [], curr_yaw
@@ -179,7 +206,7 @@ def trajectory_to_discrete_actions_close_to_goal(
             extra_actions = [turn_action_for_yaw_sign(1)] * turn_count
         else:
             extra_actions = [turn_action_for_yaw_sign(-1)] * (-turn_count)
-        final_yaw = normalize_angle(curr_yaw + turn_count * turn_angle_rad)
+        final_yaw = curr_yaw + turn_count * turn_angle_rad
         return extra_actions, final_yaw
 
     while len(actions) < max_actions:
@@ -188,7 +215,7 @@ def trajectory_to_discrete_actions_close_to_goal(
         if np.linalg.norm(pos - goal) <= pos_tolerance:
             if goal_yaw is None or not allow_final_yaw_alignment:
                 break
-            yaw_error = normalize_angle(goal_yaw - yaw)
+            yaw_error = signed_error(goal_yaw, yaw, goal_yaw)
             if abs(yaw_error) <= turn_angle_rad * 0.5:
                 break
             action = turn_action_for_yaw_sign(yaw_error)
@@ -218,7 +245,10 @@ def trajectory_to_discrete_actions_close_to_goal(
             continue
 
         target_yaw = np.arctan2(to_target[1], to_target[0])
-        yaw_error = normalize_angle(target_yaw - yaw)
+        yaw_error = signed_error(
+            target_yaw, yaw,
+            np.deg2rad(traj[source_indices[target_idx], 3]) if traj.shape[1] >= 4 else None,
+        )
         turn_threshold = turn_angle_rad * 0.5
         if yaw_error > turn_threshold:
             action = turn_action_for_yaw_sign(1)
