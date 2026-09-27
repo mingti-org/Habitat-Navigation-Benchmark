@@ -110,7 +110,7 @@ def test_stop_oracle_and_legacy_actions_keep_their_execution_semantics():
 def test_client_capabilities_negotiate_chunk_with_legacy_fallback():
     assert canonical_action.CLIENT_CAPABILITIES == {
         "action_transports": ["chunk", "discrete"],
-        "execution_semantics": ["canonical_relative_v1"],
+        "execution_semantics": ["canonical_relative_v1", "pose_events_v1"],
         "control_protocols": ["high_policy_replan_ack_v1"],
     }
 

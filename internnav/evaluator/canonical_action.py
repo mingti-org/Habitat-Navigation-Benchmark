@@ -12,6 +12,7 @@ CONTINUOUS_ACTION_HORIZON = 16
 CONTINUOUS_VALID_ACTION_DIM = 4
 CONTINUOUS_DEFAULT_EXECUTE_HORIZON = 8
 CONTINUOUS_EXECUTION_SEMANTICS = "canonical_relative_v1"
+POSE_EVENTS_CONTRACT = "pose_events_v1"
 CONTINUOUS_ACTION_FORMAT = "relative_delta_xyzyaw"
 CONTINUOUS_ACTION_UNIT = {"xyz": "m", "yaw": "deg"}
 REPLAN_ACK_CONTROL_PROTOCOL = "high_policy_replan_ack_v1"
@@ -20,7 +21,7 @@ CLIENT_CAPABILITIES = {
     # Advertised order is preference order during server negotiation. Keep the
     # legacy discrete transport as a rolling-upgrade fallback only.
     "action_transports": ["chunk", "discrete"],
-    "execution_semantics": [CONTINUOUS_EXECUTION_SEMANTICS],
+    "execution_semantics": [CONTINUOUS_EXECUTION_SEMANTICS, POSE_EVENTS_CONTRACT],
     "control_protocols": [REPLAN_ACK_CONTROL_PROTOCOL],
 }
 
@@ -35,6 +36,10 @@ def _validate_response_header(response: dict[str, Any]) -> None:
         "action_format": CONTINUOUS_ACTION_FORMAT,
         "action_unit": CONTINUOUS_ACTION_UNIT,
     }
+    semantics = response.get("execution_semantics")
+    if semantics not in (CONTINUOUS_EXECUTION_SEMANTICS, POSE_EVENTS_CONTRACT):
+        raise ValueError(f"Unsupported Habitat execution semantics: {semantics!r}")
+    required_fields["execution_semantics"] = semantics
     for key, expected in required_fields.items():
         if response.get(key) != expected:
             raise ValueError(
@@ -89,7 +94,9 @@ def canonical_response_to_trajectory(response: dict[str, Any]) -> np.ndarray:
         trajectory[index, 0] = previous[0] + cos_yaw * dx - sin_yaw * dy
         trajectory[index, 1] = previous[1] + sin_yaw * dx + cos_yaw * dy
         trajectory[index, 2] = previous[2] + dz
-        trajectory[index, 3] = (previous[3] + dyaw_deg + 180.0) % 360.0 - 180.0
+        trajectory[index, 3] = previous[3] + dyaw_deg
+        if response["execution_semantics"] != POSE_EVENTS_CONTRACT:
+            trajectory[index, 3] = (trajectory[index, 3] + 180.0) % 360.0 - 180.0
     return trajectory
 
 
@@ -293,11 +300,19 @@ def habitat_actions_from_response(
 
     trajectory = canonical_response_to_trajectory(response)
     max_actions = _validate_execute_horizon(response.get("chunk_execute_horizon"))
-    actions = trajectory_to_discrete_actions_close_to_goal(
-        trajectory,
-        max_actions=max_actions,
-        positive_yaw_action=2,
-    )
+    if response["execution_semantics"] == POSE_EVENTS_CONTRACT:
+        from enactive.simulator.habitat_event_execution import pose_events_to_discrete_actions
+        if not response.get("dagger_execute_teacher", False):
+            native_limit = response.get("dagger_student_native_action_limit")
+            if native_limit is not None:
+                max_actions = min(max_actions, _validate_execute_horizon(native_limit))
+        actions = pose_events_to_discrete_actions(trajectory, max_actions=max_actions)
+        if not actions:
+            raise ValueError("Non-STOP pose_events_v1 chunk has no executable native action")
+    else:
+        actions = trajectory_to_discrete_actions_close_to_goal(
+            trajectory, max_actions=max_actions, positive_yaw_action=2,
+        )
     if diagnostics is not None:
         diagnostics.update(
             prefix_endpoint=trajectory[-1].tolist(),
