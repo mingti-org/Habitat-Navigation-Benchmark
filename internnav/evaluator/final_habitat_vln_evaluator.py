@@ -49,6 +49,7 @@ from enactive.eval.online.habitat_results import read_result_rows, write_habitat
 from enactive.dagger.replay_teacher import (
     REPLAY_TEACHER_LABEL_MODE,
     ReplayTeacherSession,
+    GOAL_REPLAY_TEACHER_LABEL_MODE,
     quaternion_angle_error_deg,
 )
 
@@ -1316,23 +1317,26 @@ class LLMAgent(BaseAgent):
         self._replay_teacher_mode = os.getenv(
             "HABITAT_DAGGER_TEACHER_MODE", ""
         ).strip().lower()
-        if self._replay_teacher_mode not in {"", REPLAY_TEACHER_LABEL_MODE}:
+        if self._replay_teacher_mode not in {"", REPLAY_TEACHER_LABEL_MODE, GOAL_REPLAY_TEACHER_LABEL_MODE}:
             raise ValueError(
                 "HABITAT_DAGGER_TEACHER_MODE must be empty or "
                 f"{REPLAY_TEACHER_LABEL_MODE!r}"
             )
         self._replay_teacher = (
             ReplayTeacherSession(
+                final_goal_only=self._replay_teacher_mode == GOAL_REPLAY_TEACHER_LABEL_MODE,
                 gpu_device_id=int(getattr(args, "sim_gpu", 0)),
                 target_path_length_m=float(
                     os.getenv("ENACTIVE_DAGGER_TARGET_PATH_LENGTH_M", "1.5")
                 ),
                 waypoint_radius_m=float(
-                    os.getenv("HABITAT_DAGGER_TEACHER_WAYPOINT_RADIUS_M", "0.5")
+                    os.getenv("ENACTIVE_DAGGER_STOP_AT_FINAL_RADIUS_M", "1.0")
+                    if self._replay_teacher_mode == GOAL_REPLAY_TEACHER_LABEL_MODE
+                    else os.getenv("HABITAT_DAGGER_TEACHER_WAYPOINT_RADIUS_M", "0.5")
                 ),
                 max_steps=int(os.getenv("HABITAT_DAGGER_TEACHER_MAX_STEPS", "128")),
             )
-            if self._replay_teacher_mode == REPLAY_TEACHER_LABEL_MODE
+            if self._replay_teacher_mode in {REPLAY_TEACHER_LABEL_MODE, GOAL_REPLAY_TEACHER_LABEL_MODE}
             else None
         )
         self._replay_teacher_progress_index = 0
