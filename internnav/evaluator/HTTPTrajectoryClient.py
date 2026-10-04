@@ -5,29 +5,39 @@ chunks, and converts them to Habitat-native discrete actions. Legacy server
 ``actions`` responses remain supported during the migration window.
 """
 
+from enactive.common.policy_protocol import validate_episode_end
+
 import hashlib
+import json
 import os
+from typing import Optional
 import uuid
 from datetime import datetime
 from pathlib import Path
+from PIL import Image
+from enactive.inference.navigation.demonstration import validate_demonstration_response
+from enactive.eval.online.habitat_demonstration import EvaluationCondition, load_episode_replay, load_habitat_demonstration_manifest
 
-from enactive.client.deploy import EnactiveServerClient
-from enactive.eval.online.habitat_demonstration import (
-    EvaluationCondition,
-    load_episode_replay,
-    load_habitat_demonstration_manifest,
-)
+import requests
 from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
+import json_numpy
 import numpy as np
 import torch
-from PIL import Image
 
 from internnav.evaluator.canonical_action import (
     CLIENT_CAPABILITIES,
     habitat_actions_from_response,
 )
+from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort
+
+json_numpy.patch()
+
+_MAX_REPLAN_ROUNDS = 4
+_MAX_REPLAN_ACK_POST_ATTEMPTS = 3
+_MAX_EPISODE_END_POST_ATTEMPTS = 3
 
 _RESPONSE_METADATA_KEYS = (
+    "normalization",
     "action_transport",
     "schema_version",
     "control_mode",
@@ -51,6 +61,7 @@ _RESPONSE_METADATA_KEYS = (
     "dagger_teacher_actions_discrete",
     "dagger_final_actions_discrete",
     "dagger_correction_applied",
+    "dagger_abort_episode",
 )
 
 
@@ -59,6 +70,49 @@ def _flip_lateral_axis(value):
     if converted.size:
         converted[..., 1] *= -1.0
     return converted.tolist()
+
+
+def _replan_ack(result: dict) -> dict:
+    event = result.get("control_event")
+    if not isinstance(event, dict) or event.get("type") != "high_policy_replan":
+        raise ValueError(
+            "replan_required response must include control_event.type="
+            "'high_policy_replan'"
+        )
+    token = str(event.get("token") or "").strip()
+    if not token:
+        raise ValueError("replan_required control_event must include a non-empty token")
+    return {
+        "type": "high_policy_replan_ack",
+        "token": token,
+    }
+
+
+def _post_act(url: str, payload: dict, *, timeout: float):
+    observation = payload.get("observation")
+    control_event = observation.get("control_event") if isinstance(observation, dict) else None
+    is_replan_ack = bool(
+        isinstance(control_event, dict)
+        and control_event.get("type") == "high_policy_replan_ack"
+    )
+    attempts = _MAX_REPLAN_ACK_POST_ATTEMPTS if is_replan_ack else 1
+    body = json_numpy.dumps(payload)
+    for attempt in range(attempts):
+        try:
+            response = requests.post(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status_code is None or int(status_code) >= 500
+            if not is_replan_ack or not retryable or attempt + 1 >= attempts:
+                raise
+    raise RuntimeError("unreachable replan ACK retry state")
 
 
 def _action_response(result: dict, actions: list[int], replan_rounds: int) -> dict:
@@ -80,20 +134,12 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
         )
     return response
 
-
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(
-        self,
-        url,
-        *,
-        env_id: str,
-        debug_output_path=None,
-        evaluation_condition="no_demo",
-        demonstration_manifest=None,
-        eval_split=None,
-    ):
+    def __init__(self, url, *, env_id: str, debug_output_path=None, navigation_task="vln", evaluation_condition="no_demo", demonstration_manifest=None, eval_split=None):
         self.url = url
+        self.navigation_task = navigation_task
+        self.normalization_metadata = None
         self.timeout = float(os.getenv("HABITAT_CLIENT_TIMEOUT", "300"))
         self.debug_output_path = debug_output_path
         self._base_env_id = str(env_id).strip()
@@ -101,12 +147,10 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             raise ValueError("Habitat env_id is required")
         self._client_session_id = uuid.uuid4().hex
         self._active_identity = None
-        self._server_client = EnactiveServerClient(
-            url,
-            debug_output_path=debug_output_path,
-            timeout=self.timeout,
-            action_chunking="sync",
-        )
+        self._next_request_sequence = 0
+        self._session_requested = False
+        self.episode_end_result = None
+
         self._condition = EvaluationCondition.parse(evaluation_condition)
         self._eval_split = str(eval_split or "").strip()
         self._manifest = None
@@ -127,6 +171,8 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._evaluation_metadata = {}
 
     def reset(self, instruction: str, **kwargs):
+        self.normalization_metadata = None
+        self.episode_end_result = None
         episode_id = str(kwargs.get("episode_id") or "").strip()
         scene_id = str(kwargs.get("scene_id") or "").strip()
         if not episode_id or not scene_id:
@@ -141,6 +187,9 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             f"{self._base_env_id}:{scene_digest}",
             episode_id,
         )
+        self._next_request_sequence = 0
+        self._session_requested = False
+
         self._episode_replay = None
         self._evaluation_metadata = {
             "evaluation_condition": self._condition.value,
@@ -187,16 +236,16 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                         (*self._active_identity, replay.entry.replay.sha256, str(index))
                     ).encode("utf-8")
                 ).hexdigest()
-                self._server_client.ingest_demonstration(
-                    observation,
+                self._send_demo(
+                    "ingest", observation=observation,
                     demo_role=self._condition.demo_role,
                     continuous_action=replay.continuous_action_at(index),
                     request_id=f"habitat-demo-{request_digest}",
                 )
-            self._server_client.begin_query()
+            self._send_demo("query_reset")
         except BaseException:
             try:
-                self._server_client.end_episode(termination_kind="demo_ingest_failed")
+                self.end_episode({"termination_kind": "demo_ingest_failed"})
             finally:
                 self._active_identity = None
             raise
@@ -207,36 +256,41 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             lifecycle_status="query_ready",
         )
 
-    def end_episode(self, event: dict) -> dict:
-        if self._active_identity is None:
-            raise RuntimeError("Habitat trajectory client has no active episode")
-        result = self._server_client.end_episode(
-            termination_kind=str(event.get("termination_kind") or "environment_done"),
-            observation=dict(
-                zip(
-                    ("assignment_id", "env_id", "episode_id"),
-                    self._active_identity,
-                )
-            ),
-            terminal_metadata={
-                "termination_reason": str(
-                    event.get("termination_reason")
-                    or event.get("termination_kind")
-                    or "environment_done"
-                ),
-                "steps": int(event.get("steps", 0) or 0),
-                "success": bool(event.get("success", False)),
-                "client_trajectory_xyyaw_m": list(event.get("client_trajectory_xyyaw_m") or []),
-            },
-        )
-        if not isinstance(result, dict) or result.get("status") != "success":
-            raise RuntimeError(f"Habitat episode_end returned an invalid response: {result!r}")
-        self._active_identity = None
-        self._episode_replay = None
-        self._evaluation_metadata = {
-            **self._evaluation_metadata,
-            "demo_query_lifecycle_status": "complete",
-        }
+    def _register_policy_session(self):
+        if not self._session_requested:
+            task = getattr(self, "_scheduler_task", None)
+            if task is not None:
+                from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
+                scheduler = SchedulerClient.from_environment()
+                if scheduler is None:
+                    raise RuntimeError("scheduled Habitat session has no coordinator")
+                scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
+            self._session_requested = True
+
+    def _send_demo(self, operation, *, observation=None, demo_role=None, continuous_action=None, request_id=None):
+        protocol = self._protocol_observation(observation or {})
+        payload = {key: protocol[key] for key in ("assignment_id", "env_id", "episode_id", "request_sequence", "reset")}
+        payload.update(demonstration_protocol="enactive_demonstration_v1", operation=operation,
+                       request_id=request_id or protocol["request_id"].replace("habitat-act-", "habitat-demo-"))
+        protocol["request_id"] = payload["request_id"]
+        if operation == "ingest":
+            # Replay assets are already canonical; native Habitat axis conversion
+            # is only for live query observations, never for demonstration labels.
+            payload.update(demo_role=demo_role, observation={**protocol, "backend": "habitat"})
+            if demo_role == "robot_demo":
+                payload.update(schema_version=2, control_mode="continuous", action_horizon=16,
+                               valid_action_dim=4, execution_semantics="canonical_relative_v1",
+                               action_format="relative_delta_xyzyaw", action_unit={"xyz":"m", "yaw":"deg"},
+                               continuous_action=continuous_action)
+            elif continuous_action is not None:
+                raise ValueError("video demo must not carry action labels")
+        self._register_policy_session()
+        response = requests.post(self.url.rsplit("/act", 1)[0] + "/demo", data=json_numpy.dumps(payload),
+                                 headers={"Content-Type":"application/json"}, timeout=self.timeout)
+        response.raise_for_status()
+        result = json_numpy.loads(response.text)
+        validate_demonstration_response(result, operation=operation)
+        self._next_request_sequence += 1
         return result
 
     def evaluation_metadata(self) -> dict:
@@ -310,6 +364,106 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         except Exception:
             return
 
+    def _protocol_observation(
+        self,
+        observation: dict,
+        *,
+        control_event: Optional[dict] = None,
+    ) -> dict:
+        if self._active_identity is None:
+            raise RuntimeError("Habitat trajectory client was queried before reset")
+        assignment_id, env_id, episode_id = self._active_identity
+        sequence = self._next_request_sequence
+        request_digest = hashlib.sha256(
+            "\0".join(
+                (
+                    assignment_id,
+                    env_id,
+                    episode_id,
+                    str(sequence),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        prepared = dict(observation)
+        prepared["navigation_task"] = self.navigation_task
+        prepared.update(
+            {
+                "assignment_id": assignment_id,
+                "env_id": env_id,
+                "episode_id": episode_id,
+                "request_id": f"habitat-act-{request_digest}",
+                "request_sequence": sequence,
+                "reset": sequence == 0,
+            }
+        )
+        if control_event is not None:
+            prepared["control_event"] = dict(control_event)
+        else:
+            prepared.pop("control_event", None)
+        return prepared
+
+    def end_episode(self, event: dict) -> dict:
+        if self._active_identity is None:
+            raise RuntimeError("Habitat trajectory client has no active episode")
+        if event.get("termination_kind") == "accepted_teacher_unavailable" and not self._session_requested:
+            self._active_identity = None
+            self.episode_end_result = {"status": "not_started", "no_policy_session": True}
+            return self.episode_end_result
+        assignment_id, env_id, episode_id = self._active_identity
+        event_digest = hashlib.sha256(
+            "\0".join(self._active_identity).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "assignment_id": assignment_id,
+            "env_id": env_id,
+            "episode_id": episode_id,
+            "event_id": f"habitat-episode-end-{event_digest}",
+            "termination_kind": str(
+                event.get("termination_kind") or "environment_done"
+            ),
+            "termination_reason": str(
+                event.get("termination_reason")
+                or event.get("termination_kind")
+                or "environment_done"
+            ),
+            "steps": int(event.get("steps", 0) or 0),
+            "success": bool(event.get("success", False)),
+            "client_trajectory_xyyaw_m": list(
+                event.get("client_trajectory_xyyaw_m") or []
+            ),
+        }
+        body = json_numpy.dumps(payload)
+        endpoint = self.url.rsplit("/act", 1)[0] + "/episode_end"
+        response = None
+        for attempt in range(_MAX_EPISODE_END_POST_ATTEMPTS):
+            try:
+                response = requests.post(
+                    endpoint,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None),
+                    "status_code",
+                    None,
+                )
+                retryable = status_code is None or int(status_code) >= 500
+                if not retryable or attempt + 1 >= _MAX_EPISODE_END_POST_ATTEMPTS:
+                    raise
+        if response is None:
+            raise RuntimeError("Habitat episode_end produced no response")
+        result = validate_episode_end(response.json(), payload["event_id"])
+        self._active_identity = None
+        self._next_request_sequence = 0
+        self.episode_end_result = result
+        self._episode_replay = None
+        self._evaluation_metadata = {**self._evaluation_metadata, "demo_query_lifecycle_status": "complete"}
+        return result
+
     def _prepare_observation_payload(self, obs: dict) -> dict:
         """Make Habitat observations JSON-safe before json_numpy serialization.
 
@@ -319,6 +473,9 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        # Identify native execution semantics without changing task/split or
+        # the canonical server identity used for stable action-noise seeds.
+        obs_payload["backend"] = "habitat"
         depth = obs_payload.get("depth")
         if depth is None:
             obs_payload.pop("depth", None)
@@ -398,25 +555,57 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         return value
 
     def query(self, obs: dict, **kwargs) -> list[int]:
-        del kwargs
-        if self._active_identity is None:
-            raise RuntimeError("Habitat trajectory client was queried before reset")
         obs_payload = self._prepare_observation_payload(obs)
+        self._save_client_observation(obs_payload)
         metrics = obs_payload.get("metrics")
         if isinstance(metrics, dict):
             obs_payload["metrics"] = self._json_safe(metrics)
-        if self.debug_output_path:
-            self._save_client_observation(obs_payload)
-        obs_payload.update(
-            dict(
-                zip(
-                    ("assignment_id", "env_id", "episode_id"),
-                    self._active_identity,
-                )
+        # 1. 使用 HTTP 发送；控制响应在同一 observation 上透明 ACK 后重试。
+        original_obs_payload = dict(obs_payload)
+        replan_rounds = 0
+        control_event = None
+        while True:
+            obs_payload = self._protocol_observation(
+                original_obs_payload,
+                control_event=control_event,
             )
-        )
-        result = self._server_client.act(obs_payload)
-        replan_rounds = int(result.get("replan_rounds", 0) or 0)
+            payload = {"observation": obs_payload}
+            if self.debug_output_path:
+                payload["debug_output_path"] = self.debug_output_path
+            self._register_policy_session()
+            resp = _post_act(
+                self.url,
+                payload,
+                timeout=self.timeout,
+            )
+            self._next_request_sequence += 1
+
+            # 2. 还原返回值
+            result = json_numpy.loads(resp.text)
+            if isinstance(result, str):
+                result = json_numpy.loads(result)
+            if not isinstance(result, dict):
+                raise ValueError(f"unexpected /act response: {type(result)!r}")
+            selection = result.get("normalization")
+            if selection is not None:
+                if self.normalization_metadata is not None and selection != self.normalization_metadata:
+                    raise RuntimeError("normalization changed within Habitat episode")
+                self.normalization_metadata = selection
+            if result.get("error"):
+                raise RuntimeError(f"policy server rejected observation: {result['error']}")
+            if bool(result.get("dagger_abort_episode", False)):
+                raise DaggerEpisodeAbort(
+                    str(result.get("dagger_failure_type") or "teacher_unavailable")
+                )
+            if not bool(result.get("replan_required", False)):
+                break
+            if replan_rounds >= _MAX_REPLAN_ROUNDS:
+                raise RuntimeError(
+                    "policy server exceeded the maximum of "
+                    f"{_MAX_REPLAN_ROUNDS} transparent replan rounds"
+                )
+            control_event = _replan_ack(result)
+            replan_rounds += 1
 
         if (
             "actions" in result
@@ -424,7 +613,18 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             or bool(result.get("stop", False))
             or result.get("oracle_goal_gps") is not None
         ):
-            actions = habitat_actions_from_response(result)
+            diagnostics = {}
+            actions = habitat_actions_from_response(result, diagnostics=diagnostics)
+            try:
+                print("HabitatActionConversion: " + json.dumps({
+                    "episode_id": obs_payload.get("episode_id"),
+                    "scene_id": obs_payload.get("scene_id"),
+                    "step_id": obs_payload.get("step_id"),
+                    **diagnostics,
+                    "actions": actions,
+                }, separators=(",", ":")), flush=True)
+            except Exception:
+                print("[HabitatClient] Unable to record action diagnostics", flush=True)
             return _action_response(result, actions, replan_rounds)
 
         # 3. 获取 delta poses 

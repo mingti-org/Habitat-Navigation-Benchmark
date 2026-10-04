@@ -58,7 +58,7 @@ class VLNEvaluator:
         self.device = torch.device('cuda')
         self.split = split
         self.env_num = env_num
-        self.save_video = args.save_video
+        self.save_snapshots = args.save_snapshots
         self.output_path = output_path
         self.epoch = epoch
         self.config_path = config_path
@@ -322,7 +322,7 @@ class VLNEvaluator:
             vis_frames = []
             step_id = 0
 
-            if self.save_video:
+            if self.save_snapshots:
                 os.makedirs(self.output_path, exist_ok=True)
             initial_height = env.sim.get_agent_state().position[1]
 
@@ -598,7 +598,7 @@ class VLNEvaluator:
             self.infer_success_cnt += 1
 
             # metrics = env.get_metrics()
-            if self.save_video:
+            if self.save_snapshots:
                 images_to_video(vis_frames, self.output_path, f"res_{self.infer_success_cnt}", fps=6, quality=9)
             self.infer_success = True
             vis_frames.clear()
@@ -641,7 +641,7 @@ def eval():
     parser.add_argument("--output_path", type=str, default='./exps_pix/val_unseen/debug_coord_wm')
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
-    parser.add_argument("--save_video", action="store_true", default=True)
+    parser.add_argument("--save-snapshots", action="store_true")
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
