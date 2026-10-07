@@ -51,7 +51,7 @@ def _method_calls(name):
     )
 
 
-def test_demo_reset_boundary_does_not_step_target_environment():
+def test_reset_boundary_does_not_step_target_environment():
     calls = _run_episode_calls()
     reset_line = next(line for line, name in calls if name == "self.agent.reset")
     first_query_line = next(line for line, name in calls if name == "self.agent.act")

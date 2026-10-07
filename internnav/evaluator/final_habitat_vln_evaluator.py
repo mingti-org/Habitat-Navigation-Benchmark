@@ -329,8 +329,6 @@ class BaseAgent(ABC):
     def on_episode_end(self, event: dict):
         pass
 
-    def evaluation_metadata(self) -> dict:
-        return {}
     def close(self):
         pass
 
@@ -846,7 +844,6 @@ class Evaluator:
                 raise RuntimeError(
                     f"Habitat episode_end returned an invalid response: {end_result!r}"
                 )
-            result.update(self.agent.evaluation_metadata())
             result["target_init_look_down_steps"] = int(
                 getattr(self.args, "init_look_down_steps", 0)
             )
@@ -1389,8 +1386,6 @@ class LLMAgent(BaseAgent):
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
 
-    def evaluation_metadata(self) -> dict:
-        return self.traj_client.evaluation_metadata()
     def close(self):
         teacher = self._replay_teacher
         self._replay_teacher = None

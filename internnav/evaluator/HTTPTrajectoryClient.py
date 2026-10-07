@@ -15,8 +15,6 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
-from enactive.inference.navigation.demonstration import validate_demonstration_response
-from enactive.eval.online.habitat_demonstration import EvaluationCondition, load_episode_replay, load_habitat_demonstration_manifest
 
 import requests
 from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
@@ -136,7 +134,7 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(self, url, *, env_id: str, debug_output_path=None, navigation_task="vln", evaluation_condition="no_demo", demonstration_manifest=None, eval_split=None):
+    def __init__(self, url, *, env_id: str, debug_output_path=None, navigation_task="vln"):
         self.url = url
         self.navigation_task = navigation_task
         self.normalization_metadata = None
@@ -150,25 +148,6 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._next_request_sequence = 0
         self._session_requested = False
         self.episode_end_result = None
-
-        self._condition = EvaluationCondition.parse(evaluation_condition)
-        self._eval_split = str(eval_split or "").strip()
-        self._manifest = None
-        if self._condition is EvaluationCondition.NO_DEMO:
-            if demonstration_manifest not in (None, ""):
-                raise ValueError("no_demo must not provide a demonstration manifest")
-        else:
-            if not demonstration_manifest:
-                raise ValueError("demo evaluation requires a demonstration manifest")
-            if not self._eval_split:
-                raise ValueError("demo evaluation requires eval_split")
-            self._manifest = load_habitat_demonstration_manifest(
-                demonstration_manifest,
-                expected_condition=self._condition,
-                expected_split=self._eval_split,
-            )
-        self._episode_replay = None
-        self._evaluation_metadata = {}
 
     def reset(self, instruction: str, **kwargs):
         self.normalization_metadata = None
@@ -190,72 +169,6 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._next_request_sequence = 0
         self._session_requested = False
 
-        self._episode_replay = None
-        self._evaluation_metadata = {
-            "evaluation_condition": self._condition.value,
-            "demo_role": self._condition.demo_role,
-            "demo_step_count": 0,
-            "demo_manifest_sha256": None,
-            "replay_sha256": None,
-            "provenance_sha256": None,
-            "source_split": None,
-            "source_scene_id": None,
-            "source_episode_id": None,
-            "source_instruction_sha256": None,
-            "target_split": self._eval_split,
-            "target_scene_id": scene_id,
-            "target_episode_id": episode_id,
-            "target_instruction_sha256": hashlib.sha256(
-                instruction.encode("utf-8")
-            ).hexdigest(),
-            "demo_query_lifecycle_status": "query_ready",
-        }
-        if self._condition is EvaluationCondition.NO_DEMO:
-            return
-        entry = self._manifest.entry_for(
-            split=self._eval_split,
-            scene_id=scene_id,
-            episode_id=episode_id,
-            instruction=instruction,
-        )
-        replay = load_episode_replay(entry, self._condition)
-        self._episode_replay = replay
-        try:
-            for index in range(replay.step_count):
-                observation = replay.observation_at(index)
-                observation.update(
-                    dict(
-                        zip(
-                            ("assignment_id", "env_id", "episode_id"),
-                            self._active_identity,
-                        )
-                    )
-                )
-                request_digest = hashlib.sha256(
-                    "\0".join(
-                        (*self._active_identity, replay.entry.replay.sha256, str(index))
-                    ).encode("utf-8")
-                ).hexdigest()
-                self._send_demo(
-                    "ingest", observation=observation,
-                    demo_role=self._condition.demo_role,
-                    continuous_action=replay.continuous_action_at(index),
-                    request_id=f"habitat-demo-{request_digest}",
-                )
-            self._send_demo("query_reset")
-        except BaseException:
-            try:
-                self.end_episode({"termination_kind": "demo_ingest_failed"})
-            finally:
-                self._active_identity = None
-            raise
-        self._evaluation_metadata = entry.result_metadata(
-            condition=self._condition,
-            manifest_sha256=self._manifest.sha256,
-            demo_step_count=replay.step_count,
-            lifecycle_status="query_ready",
-        )
-
     def _register_policy_session(self):
         if not self._session_requested:
             task = getattr(self, "_scheduler_task", None)
@@ -267,34 +180,6 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
             self._session_requested = True
 
-    def _send_demo(self, operation, *, observation=None, demo_role=None, continuous_action=None, request_id=None):
-        protocol = self._protocol_observation(observation or {})
-        payload = {key: protocol[key] for key in ("assignment_id", "env_id", "episode_id", "request_sequence", "reset")}
-        payload.update(demonstration_protocol="enactive_demonstration_v1", operation=operation,
-                       request_id=request_id or protocol["request_id"].replace("habitat-act-", "habitat-demo-"))
-        protocol["request_id"] = payload["request_id"]
-        if operation == "ingest":
-            # Replay assets are already canonical; native Habitat axis conversion
-            # is only for live query observations, never for demonstration labels.
-            payload.update(demo_role=demo_role, observation={**protocol, "backend": "habitat"})
-            if demo_role == "robot_demo":
-                payload.update(schema_version=2, control_mode="continuous", action_horizon=16,
-                               valid_action_dim=4, execution_semantics="canonical_relative_v1",
-                               action_format="relative_delta_xyzyaw", action_unit={"xyz":"m", "yaw":"deg"},
-                               continuous_action=continuous_action)
-            elif continuous_action is not None:
-                raise ValueError("video demo must not carry action labels")
-        self._register_policy_session()
-        response = requests.post(self.url.rsplit("/act", 1)[0] + "/demo", data=json_numpy.dumps(payload),
-                                 headers={"Content-Type":"application/json"}, timeout=self.timeout)
-        response.raise_for_status()
-        result = json_numpy.loads(response.text)
-        validate_demonstration_response(result, operation=operation)
-        self._next_request_sequence += 1
-        return result
-
-    def evaluation_metadata(self) -> dict:
-        return dict(self._evaluation_metadata)
 
     def _save_client_observation(self, obs: dict):
         if not self.debug_output_path:
@@ -460,8 +345,6 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._active_identity = None
         self._next_request_sequence = 0
         self.episode_end_result = result
-        self._episode_replay = None
-        self._evaluation_metadata = {**self._evaluation_metadata, "demo_query_lifecycle_status": "complete"}
         return result
 
     def _prepare_observation_payload(self, obs: dict) -> dict:
