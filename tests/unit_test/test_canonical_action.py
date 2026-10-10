@@ -91,6 +91,48 @@ def test_pure_positive_yaw_uses_habitat_turn_left():
     assert actions == [2, 2]
 
 
+@pytest.mark.parametrize("yaw,turn", [(30.0, 2), (-30.0, 3)])
+@pytest.mark.parametrize("distance,translation", [(0.18, []), (0.25, [1])])
+def test_near_origin_chunks_preserve_final_heading(distance, translation, yaw, turn):
+    chunk = np.zeros((16, 4), dtype=np.float32)
+    chunk[0] = [distance, 0.0, 0.0, yaw]
+
+    actions = canonical_action.habitat_actions_from_response(
+        _response(chunk, execute_horizon=8)
+    )
+
+    assert actions == translation + [turn, turn]
+
+
+def test_long_translation_keeps_path_following_without_final_heading_turns():
+    chunk = np.zeros((16, 4), dtype=np.float32)
+    chunk[0] = [1.0, 0.0, 0.0, 90.0]
+
+    assert canonical_action.habitat_actions_from_response(
+        _response(chunk, execute_horizon=8)
+    ) == [1, 1, 1, 1]
+
+
+def test_action_diagnostics_distinguish_native_turns_and_forward_fallback():
+    chunk = np.zeros((16, 4), dtype=np.float32)
+    diagnostics = {}
+
+    assert canonical_action.habitat_actions_from_response(
+        _response(chunk), diagnostics=diagnostics
+    ) == [1]
+    assert diagnostics["forward_fallback"] is True
+    assert diagnostics["native_actions"] == []
+
+    chunk[0] = [0.18, 0.0, 0.0, 30.0]
+    actions = canonical_action.habitat_actions_from_response(
+        _response(chunk), diagnostics=diagnostics
+    )
+    assert actions == [2, 2]
+    assert diagnostics["native_actions"] == actions
+    assert diagnostics["forward_fallback"] is False
+    np.testing.assert_allclose(diagnostics["prefix_endpoint"], [0.18, 0.0, 0.0, 30.0])
+
+
 def test_stop_oracle_and_legacy_actions_keep_their_execution_semantics():
     chunk = np.zeros((16, 4), dtype=np.float32)
 

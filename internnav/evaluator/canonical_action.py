@@ -140,7 +140,9 @@ def trajectory_to_discrete_actions_close_to_goal(
     track_xy = resample_path(traj_xy, min_spacing=max(step_size * 0.8, 0.12))
     goal = track_xy[-1]
     total_xy_displacement = float(np.linalg.norm(track_xy[-1] - track_xy[0]))
-    allow_final_yaw_alignment = total_xy_displacement <= max(0.05, step_size * 0.5)
+    # Match the server's 0.25 m geometric STOP window without changing the
+    # position tolerance or the long-distance XY path-following policy.
+    allow_final_yaw_alignment = total_xy_displacement <= 0.25
     waypoint_idx = 1
     no_progress_steps = 0
     max_no_progress_steps = 12
@@ -265,10 +267,16 @@ def trajectory_to_discrete_actions_close_to_goal(
     return actions
 
 
-def habitat_actions_from_response(response: dict[str, Any]) -> list[int]:
+def habitat_actions_from_response(
+    response: dict[str, Any], *, diagnostics: dict[str, Any] | None = None,
+) -> list[int]:
     """Resolve legacy discrete or canonical continuous responses for Habitat."""
 
+    if diagnostics is not None:
+        diagnostics.update(stop=bool(response.get("stop", False)), forward_fallback=False)
     if bool(response.get("stop", False)):
+        if diagnostics is not None:
+            diagnostics["native_actions"] = [0]
         return [0]
     if response.get("oracle_goal_gps") is not None:
         return []
@@ -290,6 +298,12 @@ def habitat_actions_from_response(response: dict[str, Any]) -> list[int]:
         max_actions=max_actions,
         positive_yaw_action=2,
     )
+    if diagnostics is not None:
+        diagnostics.update(
+            prefix_endpoint=trajectory[-1].tolist(),
+            native_actions=list(actions),
+            forward_fallback=not bool(actions),
+        )
     # STOP is explicit in schema v2. A non-stop chunk that cannot be discretized
     # must keep the rollout alive and match the legacy Habitat forward fallback.
     return actions or [1]

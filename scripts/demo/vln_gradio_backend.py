@@ -171,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default='./exps_pix/val_unseen/debug_coord_wm')
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
-    parser.add_argument("--save_video", action="store_true", default=True)
+    parser.add_argument("--save-snapshots", action="store_true")
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)

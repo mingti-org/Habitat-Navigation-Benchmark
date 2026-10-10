@@ -35,7 +35,7 @@ def evaluator(request, tmp_path):
     from internnav.evaluator.final_habitat_vln_evaluator import Evaluator
 
     args = SimpleNamespace(
-        save_video=False,
+        save_snapshots=False,
         sim_gpu=int(os.environ.get("HABITAT_CAMERA_TEST_GPU", "0")),
         success_distance=None,
         init_look_down_steps=request.param,

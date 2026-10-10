@@ -36,15 +36,15 @@ uvicorn InternNav.scripts.eval.server_Gr00t:app \
     --port 9000
     
 # 2.接着运行eval文件
-python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save_video
+python scripts/eval/eval_main.py --model_path /data/sjh/GR00T-Internva/output_uav/checkpoint-300000 --continuous_traj --output_path result/Gr00t/val_unseen_32traj_8steps --save-snapshots
 
 
 # 2026.4.18更新：
 增加r2r和rxr评测脚本及配置文件，修改了之前的bug
 如果要运行sub_ep：
-r2r:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_r2r.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save_video --num_history 12
+r2r:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_r2r.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save-snapshots --num_history 12
 
-rxr:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_rxr.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save_video --num_history 12
+rxr:python scripts/eval/eval_main.py --habitat_config_path scripts/eval/configs/our_benchmark_config_sub_rxr.yaml --gr00t_port 9000 --output_path /data/sjh/InternNav/output --save-snapshots --num_history 12
 
 ## Enactive HTTP action contract
 

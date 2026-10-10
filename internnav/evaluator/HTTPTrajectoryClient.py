@@ -5,7 +5,10 @@ chunks, and converts them to Habitat-native discrete actions. Legacy server
 ``actions`` responses remain supported during the migration window.
 """
 
+from enactive.common.policy_protocol import validate_episode_end
+
 import hashlib
+import json
 import os
 from typing import Optional
 import uuid
@@ -15,14 +18,12 @@ from internnav.evaluator.final_habitat_vln_evaluator import BaseTrajectoryClient
 import json_numpy
 import numpy as np
 import torch
-from datetime import datetime
-from pathlib import Path
-from PIL import Image
 
 from internnav.evaluator.canonical_action import (
     CLIENT_CAPABILITIES,
     habitat_actions_from_response,
 )
+from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort
 
 json_numpy.patch()
 
@@ -31,6 +32,7 @@ _MAX_REPLAN_ACK_POST_ATTEMPTS = 3
 _MAX_EPISODE_END_POST_ATTEMPTS = 3
 
 _RESPONSE_METADATA_KEYS = (
+    "normalization",
     "action_transport",
     "schema_version",
     "control_mode",
@@ -54,6 +56,7 @@ _RESPONSE_METADATA_KEYS = (
     "dagger_teacher_actions_discrete",
     "dagger_final_actions_discrete",
     "dagger_correction_applied",
+    "dagger_abort_episode",
 )
 
 
@@ -128,8 +131,10 @@ def _action_response(result: dict, actions: list[int], replan_rounds: int) -> di
 
 #更换模型只需要添加并调用一个新的类即可，以下面这个为例
 class Gr00tTrajectoryClient(BaseTrajectoryClient):
-    def __init__(self, url, *, env_id: str, debug_output_path=None):
+    def __init__(self, url, *, env_id: str, debug_output_path=None, navigation_task="vln"):
         self.url = url
+        self.navigation_task = navigation_task
+        self.normalization_metadata = None
         self.timeout = float(os.getenv("HABITAT_CLIENT_TIMEOUT", "300"))
         self.debug_output_path = debug_output_path
         self._base_env_id = str(env_id).strip()
@@ -138,8 +143,12 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         self._client_session_id = uuid.uuid4().hex
         self._active_identity = None
         self._next_request_sequence = 0
+        self._session_requested = False
+        self.episode_end_result = None
 
     def reset(self, instruction: str, **kwargs):
+        self.normalization_metadata = None
+        self.episode_end_result = None
         episode_id = str(kwargs.get("episode_id") or "").strip()
         scene_id = str(kwargs.get("scene_id") or "").strip()
         if not episode_id or not scene_id:
@@ -155,6 +164,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             episode_id,
         )
         self._next_request_sequence = 0
+        self._session_requested = False
 
     def _protocol_observation(
         self,
@@ -177,6 +187,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             ).encode("utf-8")
         ).hexdigest()
         prepared = dict(observation)
+        prepared["navigation_task"] = self.navigation_task
         prepared.update(
             {
                 "assignment_id": assignment_id,
@@ -196,6 +207,10 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
     def end_episode(self, event: dict) -> dict:
         if self._active_identity is None:
             raise RuntimeError("Habitat trajectory client has no active episode")
+        if event.get("termination_kind") == "accepted_teacher_unavailable" and not self._session_requested:
+            self._active_identity = None
+            self.episode_end_result = {"status": "not_started", "no_policy_session": True}
+            return self.episode_end_result
         assignment_id, env_id, episode_id = self._active_identity
         event_digest = hashlib.sha256(
             "\0".join(self._active_identity).encode("utf-8")
@@ -243,81 +258,11 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                     raise
         if response is None:
             raise RuntimeError("Habitat episode_end produced no response")
-        try:
-            result = response.json()
-        except (TypeError, ValueError):
-            result = {"status": "success"}
+        result = validate_episode_end(response.json(), payload["event_id"])
         self._active_identity = None
         self._next_request_sequence = 0
-        return result if isinstance(result, dict) else {"status": "success"}
-
-    def _save_client_observation(self, obs: dict):
-        if not self.debug_output_path:
-            return
-        if os.getenv("HABITAT_SAVE_CLIENT_OBSERVATIONS", "0").strip().lower() not in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            return
-        try:
-            rgb = obs.get("rgb")
-            if rgb is None:
-                return
-            arr = np.asarray(rgb)
-            if arr.ndim == 3 and arr.shape[-1] == 4:
-                arr = arr[..., :3]
-            if arr.ndim != 3 or arr.shape[-1] != 3:
-                return
-            if arr.dtype != np.uint8:
-                if np.issubdtype(arr.dtype, np.floating) and float(np.nanmax(arr)) <= 1.0:
-                    arr = arr * 255.0
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            arr = np.ascontiguousarray(arr)
-
-            instruction = str(obs.get("instruction", "unknown_instruction"))
-            safe_instruction = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in instruction)
-            safe_instruction = "_".join(part for part in safe_instruction.split("_") if part)[:60] or "unknown_instruction"
-            step_id = obs.get("step_id", "na")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            out_dir = Path(self.debug_output_path) / "_client_observations" / safe_instruction
-            out_dir.mkdir(parents=True, exist_ok=True)
-            img_path = out_dir / f"client_{timestamp}_step{step_id}.png"
-            txt_path = out_dir / f"client_{timestamp}_step{step_id}.txt"
-            Image.fromarray(arr).save(img_path)
-
-            mean = arr.mean(axis=(0, 1))
-            std = arr.std(axis=(0, 1))
-            arr_i = arr.astype(np.int16)
-            hdiff = float(np.abs(np.diff(arr_i, axis=1)).mean())
-            vdiff = float(np.abs(np.diff(arr_i, axis=0)).mean())
-            black_frac = float((arr < 5).all(axis=2).mean())
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"instruction: {instruction}\n")
-                f.write(f"step_id: {step_id}\n")
-                for key in ("gps", "yaw", "camera_height"):
-                    if key in obs:
-                        f.write(f"{key}: {self._json_safe(obs.get(key))}\n")
-                metrics = obs.get("metrics")
-                if isinstance(metrics, dict):
-                    small_metrics = {
-                        key: metrics.get(key)
-                        for key in ("distance_to_goal", "success", "spl", "ndtw")
-                        if key in metrics
-                    }
-                    f.write(f"metrics: {self._json_safe(small_metrics)}\n")
-                f.write(f"shape: {arr.shape}\n")
-                f.write(f"dtype: {arr.dtype}\n")
-                f.write(f"min: {int(arr.min())}\n")
-                f.write(f"max: {int(arr.max())}\n")
-                f.write(f"mean: [{mean[0]}, {mean[1]}, {mean[2]}]\n")
-                f.write(f"std: [{std[0]}, {std[1]}, {std[2]}]\n")
-                f.write(f"hfdiff: {hdiff}\n")
-                f.write(f"vfdiff: {vdiff}\n")
-                f.write(f"black_frac: {black_frac}\n")
-        except Exception:
-            return
+        self.episode_end_result = result
+        return result
 
     def _prepare_observation_payload(self, obs: dict) -> dict:
         """Make Habitat observations JSON-safe before json_numpy serialization.
@@ -328,6 +273,9 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         the server side.  Send an explicit contiguous RGB copy.
         """
         obs_payload = dict(obs)
+        # Identify native execution semantics without changing task/split or
+        # the canonical server identity used for stable action-noise seeds.
+        obs_payload["backend"] = "habitat"
         depth = obs_payload.get("depth")
         if depth is None:
             obs_payload.pop("depth", None)
@@ -411,8 +359,6 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         metrics = obs_payload.get("metrics")
         if isinstance(metrics, dict):
             obs_payload["metrics"] = self._json_safe(metrics)
-        if self.debug_output_path:
-            self._save_client_observation(obs_payload)
         # 1. 使用 HTTP 发送；控制响应在同一 observation 上透明 ACK 后重试。
         original_obs_payload = dict(obs_payload)
         replan_rounds = 0
@@ -425,6 +371,15 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             payload = {"observation": obs_payload}
             if self.debug_output_path:
                 payload["debug_output_path"] = self.debug_output_path
+            if not self._session_requested:
+                task = getattr(self, "_scheduler_task", None)
+                if task is not None:
+                    from enactive.eval.online.episode_scheduler_protocol import SchedulerClient
+                    scheduler = SchedulerClient.from_environment()
+                    if scheduler is None:
+                        raise RuntimeError("scheduled Habitat session has no coordinator")
+                    scheduler.session(task, dict(zip(("assignment_id", "env_id", "episode_id"), self._active_identity)))
+                self._session_requested = True
             resp = _post_act(
                 self.url,
                 payload,
@@ -438,8 +393,17 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
                 result = json_numpy.loads(result)
             if not isinstance(result, dict):
                 raise ValueError(f"unexpected /act response: {type(result)!r}")
+            selection = result.get("normalization")
+            if selection is not None:
+                if self.normalization_metadata is not None and selection != self.normalization_metadata:
+                    raise RuntimeError("normalization changed within Habitat episode")
+                self.normalization_metadata = selection
             if result.get("error"):
                 raise RuntimeError(f"policy server rejected observation: {result['error']}")
+            if bool(result.get("dagger_abort_episode", False)):
+                raise DaggerEpisodeAbort(
+                    str(result.get("dagger_failure_type") or "teacher_unavailable")
+                )
             if not bool(result.get("replan_required", False)):
                 break
             if replan_rounds >= _MAX_REPLAN_ROUNDS:
@@ -456,7 +420,18 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
             or bool(result.get("stop", False))
             or result.get("oracle_goal_gps") is not None
         ):
-            actions = habitat_actions_from_response(result)
+            diagnostics = {}
+            actions = habitat_actions_from_response(result, diagnostics=diagnostics)
+            try:
+                print("HabitatActionConversion: " + json.dumps({
+                    "episode_id": obs_payload.get("episode_id"),
+                    "scene_id": obs_payload.get("scene_id"),
+                    "step_id": obs_payload.get("step_id"),
+                    **diagnostics,
+                    "actions": actions,
+                }, separators=(",", ":")), flush=True)
+            except Exception:
+                print("[HabitatClient] Unable to record action diagnostics", flush=True)
             return _action_response(result, actions, replan_rounds)
         
         # 3. 获取 delta poses 

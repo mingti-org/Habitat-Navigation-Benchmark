@@ -48,8 +48,11 @@ def parse_args():
     parser.add_argument("--output_path", type=str, default='./logs/habitat/test')  #!
     parser.add_argument("--num_future_steps", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=32)
-    parser.add_argument("--save_video", dest="save_video", action="store_true", default=True)
-    parser.add_argument("--no_save_video", dest="save_video", action="store_false")
+    parser.add_argument(
+        "--save-snapshots",
+        action="store_true",
+        help="Save detailed, non-essential per-step metrics and episode videos.",
+    )
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument(
         "--init_look_down_steps",
@@ -118,6 +121,7 @@ def parse_args():
 
     ###连接server_Gr00t，后续使用只需要换成正确的url即可，见main()的 ===== 1. Trajectory Client =====
     parser.add_argument('--gr00t_host', default='127.0.0.1')
+    parser.add_argument("--navigation-task", choices=("vln", "tracking"), default="vln")
     parser.add_argument('--gr00t_port', default=9000, type=int)  
 
     return parser.parse_args()
@@ -141,6 +145,7 @@ def main():
     traj_client = Gr00tTrajectoryClient(
         url=f"http://{args.gr00t_host}:{args.gr00t_port}/act",
         env_id=f"habitat-shard-{args.shard_rank}",
+        navigation_task=args.navigation_task,
         debug_output_path=os.path.join(args.output_path, "enactive_server_snapshots"),
     )
 

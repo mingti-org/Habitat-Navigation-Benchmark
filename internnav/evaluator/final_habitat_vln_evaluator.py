@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 import habitat
+import habitat_sim
 import numpy as np
 import quaternion
 import torch
@@ -39,6 +40,7 @@ from internnav.evaluator.episode_plan import (
     load_or_create_episode_plan,
     remaining_episode_keys,
 )
+from internnav.evaluator.dagger_lifecycle import DaggerEpisodeAbort
 from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass
@@ -336,6 +338,9 @@ class BaseAgent(ABC):
     def on_episode_end(self, event: dict):
         pass
 
+    def close(self):
+        pass
+
 class HabitatSensorAPI:
     def __init__(self, observations, step_id):
         self.obs = observations
@@ -467,7 +472,12 @@ class Evaluator:
             )
 
         print(f"[EvalInit] before Env(config={config_path}, split={split})", flush=True)
-        self.env = Env(config=self.config)
+        if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
+            from habitat.datasets import make_dataset
+            self._scheduled_dataset = make_dataset(self.config.habitat.dataset.type, config=self.config.habitat.dataset)
+            self.env = None  # A lease and START precede any heavy simulator allocation.
+        else:
+            self.env = Env(config=self.config)
         print("[EvalInit] after Env(config)", flush=True)
         if hasattr(self.agent, "set_env"):
             self.agent.set_env(self.env)
@@ -477,7 +487,7 @@ class Evaluator:
         self.agent = agent
         self.max_steps = max_steps
         self.output_path = output_path
-        self.save_video = args.save_video and os.getenv("HABITAT_DISABLE_VIDEO_RENDER", "0") != "1"
+        self.save_snapshots = bool(args.save_snapshots)
         self.init_look_down_steps = max(0, int(getattr(args, "init_look_down_steps", 2)))
         self.vis_frames = []
         self._prev_video_map_coord = None
@@ -644,11 +654,19 @@ class Evaluator:
         path_length = 0.0
         prev_position = np.asarray(self.env.sim.get_agent_state().position, dtype=np.float64)
         last_action_value = None
+        abort_reason = None
         client_trajectory_xyyaw_m = [
             self._model_pose_xyyaw(observations)
         ]
 
         while not done and step < self.max_steps:
+            # Collection may resolve unreachable episodes without a policy request.
+            # Evaluation retains its original metric/coverage contract.
+            if (os.environ.get("ENACTIVE_DAGGER_COLLECT") == "1"
+                    and float(self.env.get_metrics()["distance_to_goal"]) == float("inf")):
+                abort_reason = "navmesh_unreachable"
+                print(f"[Eval] episode={episode.episode_id} accepted teacher unavailable: {abort_reason}", flush=True)
+                break
             if self.env.episode_over:
                 break
             # === 模块 3：Habitat → Observation ===
@@ -661,7 +679,16 @@ class Evaluator:
             )
 
             # === 模块 5（之后）：Observation → Action ===
-            action = self.agent.act(obs)
+            try:
+                action = self.agent.act(obs)
+            except DaggerEpisodeAbort as exc:
+                abort_reason = exc.reason
+                print(
+                    f"[Eval] episode={episode.episode_id} accepted teacher unavailable: "
+                    f"{abort_reason}",
+                    flush=True,
+                )
+                break
             action_vis = self._agent_action_vis_metadata()
             before_metrics = self.env.get_metrics()
             prev_map_coord = self._current_map_coord(before_metrics)
@@ -707,14 +734,15 @@ class Evaluator:
             )
             current_dist = self.env.get_metrics().get("distance_to_goal", float("inf"))
             current_metrics = self.env.get_metrics()
-            self._write_step_metrics(
-                episode=episode,
-                episode_instruction=episode_instruction,
-                step=step,
-                metrics=current_metrics,
-                min_distance=min(min_distance, current_dist),
-                path_length=path_length,
-            )
+            if self.save_snapshots:
+                self._write_step_metrics(
+                    episode=episode,
+                    episode_instruction=episode_instruction,
+                    step=step,
+                    metrics=current_metrics,
+                    min_distance=min(min_distance, current_dist),
+                    path_length=path_length,
+                )
             print(
                 f"[EvalStep] episode={episode.episode_id} step={step} after_get_metrics",
                 flush=True,
@@ -722,7 +750,7 @@ class Evaluator:
             if current_dist < min_distance:
                 min_distance = current_dist
 
-            if self.save_video:
+            if self.save_snapshots:
                 print(
                     f"[EvalStep] episode={episode.episode_id} step={step} before_observations_to_image",
                     flush=True,
@@ -748,8 +776,8 @@ class Evaluator:
         metrics = self.env.get_metrics()
         
         # ===== evaluator-level metric（和之前完全一致）=====
-        success = metrics["success"]
-        spl = metrics["spl"]
+        success = 0.0 if abort_reason is not None else metrics["success"]
+        spl = 0.0 if abort_reason is not None else metrics["spl"]
         ne = metrics["distance_to_goal"]
         # print("self.config.habitat.task",self.config.habitat.task)
         # oracle_success：自己算（等价于你之前的）
@@ -759,7 +787,9 @@ class Evaluator:
         )
         stopped = bool(last_action_value == Action.STOP.value)
         termination_kind = (
-            "model_stop"
+            "accepted_teacher_unavailable"
+            if abort_reason is not None
+            else "model_stop"
             if stopped
             else "budget_exhausted"
             if step >= self.max_steps and not self.env.episode_over
@@ -790,6 +820,7 @@ class Evaluator:
             "last_action": int(last_action_value) if last_action_value is not None else None,
             "steps": step,
             "termination_kind": termination_kind,
+            "termination_reason": abort_reason or termination_kind,
             "episode_instruction": episode_instruction,
             "dataset_episode_instruction": (
                 episode.instruction.instruction_text
@@ -803,11 +834,14 @@ class Evaluator:
             "episode_id": str(episode.episode_id),
             "scene_id": str(episode.scene_id),
             "termination_kind": termination_kind,
-            "termination_reason": termination_kind,
+            "termination_reason": abort_reason or termination_kind,
             "steps": int(step),
             "success": bool(success),
             "client_trajectory_xyyaw_m": client_trajectory_xyyaw_m,
         }
+        normalization = getattr(getattr(self.agent, "traj_client", None), "normalization_metadata", None)
+        if normalization is not None:
+            result["normalization"] = normalization
         try:
             with open(os.path.join(self.output_path, "result.json"), "a") as f:
                 f.write(json.dumps(result) + "\n")
@@ -819,7 +853,7 @@ class Evaluator:
                 f"result.json updated"
             )
 
-            if self.save_video and len(self.vis_frames) > 0:
+            if self.save_snapshots and len(self.vis_frames) > 0:
                 print(f"[Eval] episode={episode.episode_id} before_images_to_video", flush=True)
                 scene_id = episode.scene_id.split("/")[-2]
                 save_dir = os.path.join(
@@ -1153,31 +1187,45 @@ class Evaluator:
         )
     
     def run(self):
-        current_scene = None
         process_bar = None
+        try:
+            if os.environ.get("ENACTIVE_SCHEDULER_ADDRESS"):
+                from internnav.evaluator.scheduled_evaluation import run_scheduled
+                return run_scheduled(self)
+            current_scene = None
 
-        for episode, scene_id, episode_instruction in self.iter_episodes():
-            # === new scene ===
-            if scene_id != current_scene:
+            for episode, scene_id, episode_instruction in self.iter_episodes():
+                # === new scene ===
+                if scene_id != current_scene:
+                    if process_bar is not None:
+                        process_bar.close()
+
+                    current_scene = scene_id
+                    process_bar = tqdm.tqdm(
+                        desc=f"scene {scene_id}",
+                        unit="ep",
+                    )
+
+                # === run one episode ===
+                self.run_episode(episode)
+
+                # === update bar ===
+                process_bar.update(1)
+
+            self._summarize_results()
+        finally:
+            # Attempt every close, preserving the original exception chain.
+            try:
                 if process_bar is not None:
                     process_bar.close()
-
-                current_scene = scene_id
-                process_bar = tqdm.tqdm(
-                    desc=f"scene {scene_id}",
-                    unit="ep",
-                )
-
-            # === run one episode ===
-            self.run_episode(episode)
-
-            # === update bar ===
-            process_bar.update(1)
-
-        if process_bar is not None:
-            process_bar.close()
-
-        self._summarize_results()
+            finally:
+                try:
+                    self.agent.close()
+                finally:
+                    if self.env is not None:
+                        env = self.env
+                        self.env = None
+                        env.close()
 
     def _summarize_results(self):
         result_path = os.path.join(self.output_path, "result.json")
@@ -1257,6 +1305,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
         self._query_server_during_oracle = os.getenv("HABITAT_QUERY_SERVER_DURING_ORACLE", "0").strip().lower() in {
             "1",
             "true",
@@ -1291,6 +1340,10 @@ class LLMAgent(BaseAgent):
 
     def set_env(self, env):
         self.env = env
+        if env is None:
+            self._dagger_oracle_follower = None
+            if self._replay_teacher is not None:
+                self._replay_teacher.close()
 
     def reset(self, instruction: str, init_yaw: float = None, initial_height: float = 0.0 , **kwargs):
         if instruction is None:
@@ -1319,6 +1372,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
         self.last_action_metadata = {}
         self._executed_actions_since_query = []
         self._replay_teacher_progress_index = 0
@@ -1330,6 +1384,14 @@ class LLMAgent(BaseAgent):
 
     def on_episode_end(self, event: dict):
         return self.traj_client.end_episode(event)
+
+    def close(self):
+        teacher = self._replay_teacher
+        self._replay_teacher = None
+        self._dagger_oracle_follower = None
+        self.env = None
+        if teacher is not None:
+            teacher.close()
 
     @staticmethod
     def _agent_state_xyzw(state):
@@ -1453,12 +1515,16 @@ class LLMAgent(BaseAgent):
             self._dagger_oracle_phase = None
             self._dagger_oracle_source = "dagger"
             self._dagger_oracle_follower = None
+            self._dagger_oracle_goal_radius_m = None
+            if not action_response.get("eval_gt_low_policy"):
+                raise DaggerEpisodeAbort("native_oracle_goal_conversion_failed")
             return
         radius = float(action_response.get("oracle_goal_radius", 0.35))
         self._dagger_oracle_source = "eval_gt_low_policy" if action_response.get("eval_gt_low_policy") else "dagger"
         self._dagger_oracle_goal_world = np.asarray(goal_world, dtype=np.float32)
         self._dagger_oracle_goal_index = int(goal_index) if goal_index is not None else None
         self._dagger_oracle_remaining = int(action_response.get("oracle_max_steps", 80))
+        self._dagger_oracle_goal_radius_m = radius
         self._dagger_oracle_phase = "rejoin"
         self._dagger_oracle_follower = ShortestPathFollower(self.env.sim, radius, False)
         print(
@@ -1479,6 +1545,7 @@ class LLMAgent(BaseAgent):
         self._dagger_oracle_phase = None
         self._dagger_oracle_source = "dagger"
         self._dagger_oracle_follower = None
+        self._dagger_oracle_goal_radius_m = None
 
     def _oracle_log_label(self) -> str:
         if getattr(self, "_dagger_oracle_source", "") == "eval_gt_low_policy":
@@ -1497,16 +1564,49 @@ class LLMAgent(BaseAgent):
         }
 
     def _next_dagger_oracle_action(self):
-        if (
-            self._dagger_oracle_goal_world is None
-            or self._dagger_oracle_follower is None
-            or self._dagger_oracle_remaining <= 0
-        ):
+        if self._dagger_oracle_goal_world is None or self._dagger_oracle_follower is None:
             self._reset_dagger_oracle()
             return None
-        action = self._dagger_oracle_follower.get_next_action(self._dagger_oracle_goal_world)
+        if self._dagger_oracle_remaining <= 0:
+            source = self._dagger_oracle_source
+            self._reset_dagger_oracle()
+            if source == "dagger":
+                raise DaggerEpisodeAbort("native_oracle_budget_exhausted")
+            return None
+        try:
+            action = self._dagger_oracle_follower.get_next_action(
+                self._dagger_oracle_goal_world
+            )
+        except habitat_sim.errors.GreedyFollowerError as exc:
+            source = self._dagger_oracle_source
+            self._reset_dagger_oracle()
+            if source == "dagger":
+                raise DaggerEpisodeAbort(
+                    f"native_oracle_greedy_follower_error:{type(exc).__name__}"
+                ) from exc
+            raise
         if action is None or int(action) == Action.STOP.value:
             phase = self._dagger_oracle_phase or "rejoin"
+            position = np.asarray(
+                self.env.sim.get_agent_state().position, dtype=np.float32
+            )
+            distance = float(
+                self.env.sim.geodesic_distance(
+                    position, self._dagger_oracle_goal_world
+                )
+            )
+            radius = float(self._dagger_oracle_goal_radius_m or 0.0)
+            source = self._dagger_oracle_source
+            if not np.isfinite(distance) or distance > radius + 1e-4:
+                self._reset_dagger_oracle()
+                if source == "dagger":
+                    raise DaggerEpisodeAbort(
+                        "native_oracle_false_reached:"
+                        f"geodesic={distance}:radius={radius}"
+                    )
+                raise RuntimeError(
+                    "Habitat native oracle returned STOP outside its goal radius"
+                )
             print(f"[LLMAgent] {self._oracle_log_label()} {phase} target reached")
             self._reset_dagger_oracle()
             return None
