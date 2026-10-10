@@ -174,3 +174,37 @@ def test_missing_or_wrong_schema_version_is_rejected(schema_version):
 
     with pytest.raises(ValueError, match="schema_version"):
         canonical_action.canonical_response_to_trajectory(response)
+
+
+@pytest.mark.parametrize("direction", [1.0, -1.0])
+def test_canonical_reconstruction_preserves_accumulated_heading(direction):
+    chunk = np.zeros((16, 4), dtype=np.float64)
+    chunk[:8, 0] = 0.25
+    chunk[:8, 3] = direction * 90.0
+    trajectory = canonical_action.canonical_response_to_trajectory(_response(chunk))
+    np.testing.assert_allclose(trajectory[:, 3], direction * np.arange(9) * 90.0)
+    np.testing.assert_allclose(trajectory[-1, :2], [0.0, 0.0], atol=1e-12)
+
+
+@pytest.mark.parametrize("yaw,turn", [(180.0, 2), (-180.0, 3), (179.0, 2), (-179.0, 3)])
+def test_equal_cost_half_turn_uses_matched_pose_direction(yaw, turn):
+    trajectory = np.asarray([[0., 0., 0., 0.], [-1., 0., 0., yaw]])
+    actions = canonical_action.trajectory_to_discrete_actions_close_to_goal(trajectory)
+    assert actions[:12] == [turn] * 12
+    assert actions[12:] == [1] * 4
+
+
+@pytest.mark.parametrize("yaw", [90.0, 270.0, 540.0])
+def test_unmatched_or_multi_turn_pose_cannot_reverse_shortest_bearing(yaw):
+    trajectory = np.asarray([[0., 0., 0., 0.], [-1., 0., 0., yaw]])
+    actions = canonical_action.trajectory_to_discrete_actions_close_to_goal(trajectory)
+    assert actions[:12] == [3] * 12
+
+
+def test_later_corner_heading_does_not_reverse_current_half_turn():
+    trajectory = np.asarray([
+        [0., 0., 0., 0.], [-.5, 0., 0., -180.], [-1., 0., 0., -180.],
+        [-1., .5, 0., 90.],
+    ])
+    actions = canonical_action.trajectory_to_discrete_actions_close_to_goal(trajectory)
+    assert actions[:12] == [3] * 12
