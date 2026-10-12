@@ -276,6 +276,7 @@ class Gr00tTrajectoryClient(BaseTrajectoryClient):
         # Identify native execution semantics without changing task/split or
         # the canonical server identity used for stable action-noise seeds.
         obs_payload["backend"] = "habitat"
+        obs_payload["motion_yaw_tolerance_deg"] = 7.5
         depth = obs_payload.get("depth")
         if depth is None:
             obs_payload.pop("depth", None)
