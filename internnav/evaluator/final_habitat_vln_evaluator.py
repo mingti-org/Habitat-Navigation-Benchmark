@@ -780,7 +780,11 @@ class Evaluator:
         ne = metrics["distance_to_goal"]
         # print("self.config.habitat.task",self.config.habitat.task)
         # oracle_success：自己算（等价于你之前的）
-        ndtw_score = metrics.get("ndtw", 0.0)
+        ndtw_score = metrics.get("ndtw")
+        ndtw_measure = self.env.task.measurements.measures.get("ndtw")
+        ndtw_contract = ndtw_measure.contract if ndtw_measure is not None else None
+        from enactive.eval.online.habitat_ndtw import validate_result
+        validate_result({"ndtw": ndtw_score, "ndtw_contract": ndtw_contract}, ndtw_contract)
         oracle_success = float(
             min_distance < self.config.habitat.task.measurements.success.success_distance
         )
@@ -812,6 +816,7 @@ class Evaluator:
             "final_distance_to_goal": ne,
             "min_distance": float(min_distance),
             "ndtw": ndtw_score,
+            "ndtw_contract": ndtw_contract,
             "success_distance": float(self.config.habitat.task.measurements.success.success_distance),
             "path_length": float(path_length),
             "shortest_path_length": float(shortest_path_length),
@@ -986,7 +991,7 @@ class Evaluator:
             "distance_to_goal": float(metrics.get("distance_to_goal", float("inf"))),
             "success": float(metrics.get("success", 0.0)),
             "spl": float(metrics.get("spl", 0.0)),
-            "ndtw": float(metrics.get("ndtw", 0.0)),
+            "ndtw": metrics.get("ndtw"),
             "min_distance": float(min_distance),
             "path_length": float(path_length),
             "success_distance": float(self.config.habitat.task.measurements.success.success_distance),

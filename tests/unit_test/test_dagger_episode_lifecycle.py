@@ -53,6 +53,7 @@ class _Env:
     def __init__(self) -> None:
         self.episode_over = False
         self.step_count = 0
+        self.task = SimpleNamespace(measurements=SimpleNamespace(measures={}))
         self.sim = SimpleNamespace(
             get_agent_state=lambda: SimpleNamespace(
                 position=np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
@@ -70,7 +71,7 @@ class _Env:
             "distance_to_goal": 0.1 if self.episode_over else 5.0,
             "success": 1.0 if self.episode_over else 0.0,
             "spl": 1.0 if self.episode_over else 0.0,
-            "ndtw": 1.0 if self.episode_over else 0.0,
+            "ndtw": None,
         }
 
 
